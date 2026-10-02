@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CaptureViewer
+GenericName=HDMI Capture Viewer
+Comment=Low-latency Linux video capture viewer
+Exec=captureviewer
+Icon=io.github.wully616.captureviewer
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupNotify=true

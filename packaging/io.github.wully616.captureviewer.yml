@@ -1,0 +1,17 @@
+app-id: io.github.wully616.captureviewer
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: captureviewer
+finish-args:
+  - --socket=x11
+  - --socket=pulseaudio
+  - --device=all
+modules:
+  - name: captureviewer
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+    sources:
+      - type: dir
+        path: ..

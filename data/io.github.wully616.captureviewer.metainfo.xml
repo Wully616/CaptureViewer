@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.wully616.captureviewer.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>CaptureViewer</name>
+  <developer id="io.github.wully616">
+    <name>Wully616</name>
+  </developer>
+  <summary>Low-latency Linux video capture viewer</summary>
+  <description>
+    <p>A lightweight native GTK and GStreamer application for viewing live
+    video from V4L2 capture devices and monitoring HDMI audio. The tested
+    hardware profile is the Hagibis UHC07 (MACROSILICON USB 345f:2130).
+    Other V4L2/UVC devices have not been verified.</p>
+  </description>
+  <launchable type="desktop-id">io.github.wully616.captureviewer.desktop</launchable>
+  <url type="homepage">https://github.com/Wully616/CaptureViewer</url>
+  <provides>
+    <binary>captureviewer</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-02">
+      <description><p>Development packaging metadata.</p></description>
+    </release>
+  </releases>
+</component>
