@@ -384,7 +384,7 @@ setup_video_branch(CapturePipeline *pipeline, const CaptureVideoNode *node,
         gst_object_unref(capsfilter);
         gst_object_unref(queue);
         gst_object_unref(convert);
-        gst_object_unref(sink);
+        gst_object_unref(fps);
         return FALSE;
     }
 
