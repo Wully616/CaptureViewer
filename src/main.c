@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "capture.h"
 #include "pipeline.h"
+#include "preferences.h"
 #include "renderer.h"
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
@@ -52,22 +53,17 @@ struct AppState {
     GtkWidget *perf_label;
     GPtrArray *modes;
     GPtrArray *video_devices;
-    GHashTable *mode_preferences;
+    CapturePreferences *preferences;
+    CapturePreferencesValues *prefs;
     CaptureDevice *video_device;
     CaptureVideoNode *video_node;
-    gchar *selected_video_device_id;
-    gchar *selected_video_parent_path;
-    gchar *selected_node_interface;
     GstDeviceMonitor *device_monitor;
     GstDevice *audio_device;
     gchar *audio_device_id;
     gchar *audio_display_name;
     gchar *audio_sink_name;
     gchar *audio_sink_id;
-    gchar *audio_selection_id;
     gchar *audio_selection_status;
-    gchar *legacy_mode_key;
-    gchar *config_path;
     gchar *log_path;
     gchar *renderer_backend_logged;
     gchar *pipeline_error;
@@ -78,15 +74,9 @@ struct AppState {
     guint stats_watch_id;
     guint dwell_watch_id;
     guint panel_hide_watch_id;
-    guint config_save_watch_id;
     gint64 retry_after_us;
     guint current_mode;
-    gdouble volume;
-    gboolean audio_enabled;
-    CaptureRendererScaleMode scale_mode;
     gboolean updating_controls;
-    guint panel_dwell_ms;
-    guint panel_hide_delay_ms;
     gint64 keyboard_active_until_us;
     gboolean fullscreen;
     gboolean closing;
@@ -95,10 +85,6 @@ struct AppState {
     gboolean edge_hotspot_inside;
     gboolean mode_popup_open;
     gboolean interaction_active;
-    gboolean pinned;
-    gboolean stats_visible;
-    gboolean include_advanced_sources;
-    gboolean audio_selection_session_only;
     gboolean settings_open;
     GMutex log_mutex;
 };
@@ -111,8 +97,6 @@ static void app_log_renderer_backend(AppState *app);
 static void app_show_control_panel(AppState *app);
 static void app_hide_control_panel(AppState *app);
 static void app_schedule_panel_hide(AppState *app);
-static void app_save_preferences(AppState *app);
-static void app_schedule_preference_save(AppState *app);
 static void create_control_panel(AppState *app);
 static void create_settings(AppState *app);
 static void populate_video_devices(AppState *app);
@@ -417,8 +401,8 @@ resolve_selected_audio_device(AppState *app, gchar **identity, gchar **status)
 {
     *identity = NULL;
     *status = NULL;
-    const gchar *selection = app->audio_selection_id != NULL
-        ? app->audio_selection_id : "auto";
+    const gchar *selection = app->prefs->audio_selection_id != NULL
+        ? app->prefs->audio_selection_id : "auto";
     if (g_str_equal(selection, "none")) {
         *status = g_strdup("No audio input selected");
         return NULL;
@@ -487,8 +471,8 @@ populate_audio_selector(AppState *app)
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
                               "none", "None");
     gboolean selected_present =
-        g_strcmp0(app->audio_selection_id, "auto") == 0 ||
-        g_strcmp0(app->audio_selection_id, "none") == 0;
+        g_strcmp0(app->prefs->audio_selection_id, "auto") == 0 ||
+        g_strcmp0(app->prefs->audio_selection_id, "none") == 0;
     GHashTable *seen =
         g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     GList *devices = app->device_monitor != NULL
@@ -505,18 +489,18 @@ populate_audio_selector(AppState *app)
                                       identity, name);
             g_free(name);
         }
-        if (g_strcmp0(identity, app->audio_selection_id) == 0)
+        if (g_strcmp0(identity, app->prefs->audio_selection_id) == 0)
             selected_present = TRUE;
         g_free(identity);
     }
     g_list_free_full(devices, g_object_unref);
-    if (!selected_present && app->audio_selection_id != NULL)
+    if (!selected_present && app->prefs->audio_selection_id != NULL)
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
-                                  app->audio_selection_id,
+                                  app->prefs->audio_selection_id,
                                   "Selected audio input unavailable");
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_combo),
-                                app->audio_selection_id != NULL
-                                    ? app->audio_selection_id : "auto");
+                                app->prefs->audio_selection_id != NULL
+                                    ? app->prefs->audio_selection_id : "auto");
     g_hash_table_unref(seen);
     app->updating_controls = FALSE;
 }
@@ -565,102 +549,17 @@ find_default_audio_output(AppState *app, gchar **display_name, gchar **device_id
     return found;
 }
 
-static gchar *
-mode_preference_digest(const gchar *stable_id)
-{
-    return stable_id != NULL
-        ? g_compute_checksum_for_string(G_CHECKSUM_SHA256, stable_id, -1) : NULL;
-}
-
-static void
-migrate_mode_preference(AppState *app, const gchar *old_id, const gchar *new_id)
-{
-    if (old_id == NULL || new_id == NULL || g_str_equal(old_id, new_id))
-        return;
-    gchar *old_digest = mode_preference_digest(old_id);
-    gchar *new_digest = mode_preference_digest(new_id);
-    const gchar *old_mode = g_hash_table_lookup(app->mode_preferences, old_digest);
-    if (old_mode != NULL && !g_hash_table_contains(app->mode_preferences, new_digest))
-        g_hash_table_insert(app->mode_preferences, g_strdup(new_digest),
-                            g_strdup(old_mode));
-    g_hash_table_remove(app->mode_preferences, old_digest);
-    g_free(old_digest);
-    g_free(new_digest);
-}
-
-static void
-app_save_preferences(AppState *app)
-{
-    GKeyFile *key_file = g_key_file_new();
-    if (app->selected_video_device_id != NULL)
-        g_key_file_set_string(key_file, "capture", "device-id",
-                              app->selected_video_device_id);
-    if (app->selected_video_parent_path != NULL)
-        g_key_file_set_string(key_file, "capture", "device-parent",
-                              app->selected_video_parent_path);
-    if (app->selected_node_interface != NULL)
-        g_key_file_set_string(key_file, "capture", "node-id",
-                              app->selected_node_interface);
-    if (app->legacy_mode_key != NULL && app->selected_video_device_id == NULL)
-        g_key_file_set_string(key_file, "capture", "mode", app->legacy_mode_key);
-    g_key_file_set_boolean(key_file, "capture", "advanced-sources",
-                           app->include_advanced_sources);
-    g_key_file_set_boolean(key_file, "audio", "enabled", app->audio_enabled);
-    if (!app->audio_selection_session_only && app->audio_selection_id != NULL)
-        g_key_file_set_string(key_file, "audio", "source-id",
-                              app->audio_selection_id);
-    g_key_file_set_double(key_file, "audio", "volume", app->volume);
-    GHashTableIter iter;
-    gpointer digest, mode_key;
-    g_hash_table_iter_init(&iter, app->mode_preferences);
-    while (g_hash_table_iter_next(&iter, &digest, &mode_key))
-        g_key_file_set_string(key_file, "capture-modes", digest, mode_key);
-    g_key_file_set_boolean(key_file, "ui", "panel-pinned", app->pinned);
-    g_key_file_set_boolean(key_file, "ui", "stats-visible", app->stats_visible);
-    g_key_file_set_integer(key_file, "ui", "dwell-ms", app->panel_dwell_ms);
-    g_key_file_set_integer(key_file, "ui", "hide-delay-ms", app->panel_hide_delay_ms);
-    g_key_file_set_string(key_file, "ui", "scaling-mode",
-                          app->scale_mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
-    gsize length = 0;
-    gchar *contents = g_key_file_to_data(key_file, &length, NULL);
-    gchar *directory = g_path_get_dirname(app->config_path);
-    if (g_mkdir_with_parents(directory, 0700) == 0)
-        g_file_set_contents(app->config_path, contents, (gssize)length, NULL);
-    g_free(directory);
-    g_free(contents);
-    g_key_file_unref(key_file);
-}
-
-static gboolean
-save_preferences_timeout(gpointer user_data)
-{
-    AppState *app = user_data;
-    app->config_save_watch_id = 0;
-    app_save_preferences(app);
-    return G_SOURCE_REMOVE;
-}
-
-static void
-app_schedule_preference_save(AppState *app)
-{
-    if (app->config_save_watch_id != 0)
-        g_source_remove(app->config_save_watch_id);
-    app->config_save_watch_id = g_timeout_add(250, save_preferences_timeout, app);
-}
-
 static void
 save_preferred_mode(AppState *app)
 {
     if (app->video_device == NULL || app->modes == NULL ||
         app->current_mode >= app->modes->len)
         return;
-    gchar *digest = mode_preference_digest(app->video_device->stable_id);
-    gchar *mode_key = capture_mode_key(g_ptr_array_index(app->modes, app->current_mode));
-    g_hash_table_replace(app->mode_preferences, digest, mode_key);
-    if (app->video_device->usb_vid == 0x345f &&
-        app->video_device->usb_pid == 0x2130)
-        g_clear_pointer(&app->legacy_mode_key, g_free);
-    app_schedule_preference_save(app);
+    CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
+    gchar *mode_key = capture_mode_key(mode);
+    capture_preferences_set_mode_for_device(
+        app->preferences, app->video_device->stable_id,
+        app->video_device->usb_vid, app->video_device->usb_pid, mode_key);
 }
 
 static const gchar *
@@ -668,14 +567,9 @@ preferred_mode_for_device(AppState *app)
 {
     if (app->video_device == NULL)
         return NULL;
-    gchar *digest = mode_preference_digest(app->video_device->stable_id);
-    const gchar *mode_key = g_hash_table_lookup(app->mode_preferences, digest);
-    g_free(digest);
-    if (mode_key == NULL && app->legacy_mode_key != NULL &&
-        app->video_device->usb_vid == 0x345f &&
-        app->video_device->usb_pid == 0x2130)
-        mode_key = app->legacy_mode_key;
-    return mode_key;
+    return capture_preferences_mode_for_device(
+        app->preferences, app->video_device->stable_id,
+        app->video_device->usb_vid, app->video_device->usb_pid);
 }
 
 static guint
@@ -796,7 +690,7 @@ pipeline_start(AppState *app)
     CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
     gboolean started = capture_pipeline_start(
         app->pipeline, app->video_device, app->video_node, mode,
-        app->audio_device, app->audio_enabled, app->volume,
+        app->audio_device, app->prefs->audio_enabled, app->prefs->volume,
         app->audio_device_id, app->audio_selection_status);
     app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
     if (started)
@@ -822,7 +716,7 @@ refresh_audio_source(AppState *app)
     }
     if (audio_changed) {
         if (app->pipeline != NULL &&
-            capture_pipeline_is_running(app->pipeline) && app->audio_enabled)
+            capture_pipeline_is_running(app->pipeline) && app->prefs->audio_enabled)
             pipeline_stop(app);
         if (app->audio_device != NULL)
             gst_object_unref(app->audio_device);
@@ -1009,8 +903,8 @@ set_video_source(AppState *app, CaptureDevice *device, CaptureVideoNode *node)
 static void
 replace_video_devices(AppState *app, GPtrArray *fresh_devices)
 {
-    const gchar *desired_id = app->selected_video_device_id;
-    const gchar *desired_parent = app->selected_video_parent_path;
+    const gchar *desired_id = app->prefs->selected_video_device_id;
+    const gchar *desired_parent = app->prefs->selected_video_parent_path;
     if (desired_id == NULL && app->video_device != NULL)
         desired_id = app->video_device->stable_id;
     if (desired_parent == NULL && app->video_device != NULL)
@@ -1037,10 +931,10 @@ replace_video_devices(AppState *app, GPtrArray *fresh_devices)
     }
     if (initial_selection && fresh_device != NULL &&
         (fresh_device->usb_vid != 0x345f || fresh_device->usb_pid != 0x2130))
-        g_clear_pointer(&app->legacy_mode_key, g_free);
+        g_clear_pointer(&app->prefs->legacy_mode_key, g_free);
 
     CaptureVideoNode *fresh_node = fresh_device != NULL
-        ? find_video_node_by_interface(fresh_device, app->selected_node_interface) : NULL;
+        ? find_video_node_by_interface(fresh_device, app->prefs->selected_node_interface) : NULL;
     if (fresh_node == NULL)
         fresh_node = fresh_device != NULL
             ? find_video_node_by_path(fresh_device, app->video_node != NULL
@@ -1052,21 +946,22 @@ replace_video_devices(AppState *app, GPtrArray *fresh_devices)
     if (fresh_device != NULL) {
         if (desired_parent != NULL &&
             g_strcmp0(desired_parent, fresh_device->physical_sysfs) == 0)
-            migrate_mode_preference(app, desired_id, fresh_device->stable_id);
+            capture_preferences_migrate_device_id(
+                app->preferences, desired_id, fresh_device->stable_id);
         gboolean selection_changed =
-            g_strcmp0(app->selected_video_device_id, fresh_device->stable_id) != 0 ||
-            g_strcmp0(app->selected_video_parent_path,
+            g_strcmp0(app->prefs->selected_video_device_id, fresh_device->stable_id) != 0 ||
+            g_strcmp0(app->prefs->selected_video_parent_path,
                       fresh_device->physical_sysfs) != 0;
-        g_free(app->selected_video_device_id);
-        app->selected_video_device_id = g_strdup(fresh_device->stable_id);
-        g_free(app->selected_video_parent_path);
-        app->selected_video_parent_path = g_strdup(fresh_device->physical_sysfs);
+        g_free(app->prefs->selected_video_device_id);
+        app->prefs->selected_video_device_id = g_strdup(fresh_device->stable_id);
+        g_free(app->prefs->selected_video_parent_path);
+        app->prefs->selected_video_parent_path = g_strdup(fresh_device->physical_sysfs);
         if (fresh_node != NULL) {
-            g_free(app->selected_node_interface);
-            app->selected_node_interface = g_strdup(fresh_node->interface_sysfs);
+            g_free(app->prefs->selected_node_interface);
+            app->prefs->selected_node_interface = g_strdup(fresh_node->interface_sysfs);
         }
         if (selection_changed)
-            app_schedule_preference_save(app);
+            capture_preferences_schedule_save(app->preferences);
     }
 
     GPtrArray *old_devices = app->video_devices;
@@ -1239,10 +1134,10 @@ app_refresh_ui(AppState *app)
                 ? app->video_device->stable_id : "unavailable",
             app->video_device->physical_sysfs != NULL
                 ? app->video_device->physical_sysfs : "unavailable");
-    } else if (app->selected_video_device_id != NULL) {
+    } else if (app->prefs->selected_video_device_id != NULL) {
         device_text = g_strdup_printf(
             "Saved video source unavailable: %s\nWaiting for reconnection or another source",
-            app->selected_video_device_id);
+            app->prefs->selected_video_device_id);
     } else {
         device_text = g_strdup(
             "No video source selected. Connect a USB capture device or choose a source.");
@@ -1283,18 +1178,18 @@ app_refresh_ui(AppState *app)
 
     if (app->audio_toggle != NULL) {
         gtk_widget_set_sensitive(app->audio_toggle,
-                                 g_strcmp0(app->audio_selection_id, "none") != 0);
+                                 g_strcmp0(app->prefs->audio_selection_id, "none") != 0);
         if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app->audio_toggle)) !=
-            app->audio_enabled) {
+            app->prefs->audio_enabled) {
             app->updating_controls = TRUE;
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->audio_toggle),
-                                         app->audio_enabled);
+                                         app->prefs->audio_enabled);
             app->updating_controls = FALSE;
         }
     }
     if (app->volume_scale != NULL)
         gtk_widget_set_sensitive(app->volume_scale,
-                                 app->audio_enabled && app->audio_device != NULL);
+                                 app->prefs->audio_enabled && app->audio_device != NULL);
 
     gchar *overlay_text = NULL;
     gchar *perf = NULL;
@@ -1314,7 +1209,7 @@ app_refresh_ui(AppState *app)
             stats.current_fps, stats.average_fps, stats.frames_dropped,
             stats.queue_level, stats.cpu_percent, latency_text);
         audio_stats =
-            app->audio_device != NULL && app->audio_enabled &&
+            app->audio_device != NULL && app->prefs->audio_enabled &&
             app->pipeline != NULL && capture_pipeline_has_audio_source(app->pipeline)
             ? (stats.audio_source_latency_us >= 0 &&
                stats.audio_source_buffer_us >= 0
@@ -1352,15 +1247,15 @@ app_refresh_ui(AppState *app)
             : (app->audio_sink_id != NULL && *app->audio_sink_id != '\0'
                 ? g_strdup(app->audio_sink_id) : NULL);
         const gchar *policy =
-            app->audio_selection_id == NULL ||
-            g_str_equal(app->audio_selection_id, "auto") ? "Auto" :
-            g_str_equal(app->audio_selection_id, "none") ? "None" : "Explicit source";
+            app->prefs->audio_selection_id == NULL ||
+            g_str_equal(app->prefs->audio_selection_id, "auto") ? "Auto" :
+            g_str_equal(app->prefs->audio_selection_id, "none") ? "None" : "Explicit source";
         const gchar *input_name = app->audio_display_name != NULL
             ? app->audio_display_name : "No audio input";
         const gchar *input_identity = app->audio_device_id != NULL
             ? app->audio_device_id : "unavailable";
         gchar *route_text;
-        if (!app->audio_enabled)
+        if (!app->prefs->audio_enabled)
             route_text = g_strdup("Audio is disabled");
         else if (app->audio_device == NULL)
             route_text = g_strdup(app->audio_selection_status != NULL
@@ -1389,7 +1284,7 @@ app_refresh_ui(AppState *app)
             status_base = "Capture pipeline active";
         else if (pipeline_error != NULL)
             status_base = "Capture pipeline stopped after an error";
-        else if (app->video_device == NULL && app->selected_video_device_id != NULL)
+        else if (app->video_device == NULL && app->prefs->selected_video_device_id != NULL)
             status_base = "Saved video source is unavailable";
         else if (app->video_device == NULL)
             status_base = "No video capture source selected";
@@ -1425,7 +1320,7 @@ app_refresh_ui(AppState *app)
 
     if (app->status_overlay_label != NULL && app->status_overlay != NULL) {
         const gchar *message = NULL;
-        if (app->video_device == NULL && app->selected_video_device_id != NULL)
+        if (app->video_device == NULL && app->prefs->selected_video_device_id != NULL)
             message = "Saved source unavailable\nReconnect it or choose another source.";
         else if (app->video_device == NULL)
             message = "Waiting for a USB video capture source";
@@ -1552,9 +1447,9 @@ video_source_changed(GtkComboBox *combo, gpointer user_data)
     CaptureDevice *device =
         capture_device_find_by_id(app->video_devices, device_id);
     if (device == NULL) {
-        g_free(app->selected_video_device_id);
-        app->selected_video_device_id = g_strdup(device_id);
-        app_schedule_preference_save(app);
+        g_free(app->prefs->selected_video_device_id);
+        app->prefs->selected_video_device_id = g_strdup(device_id);
+        capture_preferences_schedule_save(app->preferences);
         set_video_source(app, NULL, NULL);
         refresh_audio_source(app);
         app_restart_pipeline(app);
@@ -1563,19 +1458,19 @@ video_source_changed(GtkComboBox *combo, gpointer user_data)
     gboolean same_physical_device = app->video_device != NULL &&
         g_strcmp0(app->video_device->physical_sysfs, device->physical_sysfs) == 0;
     CaptureVideoNode *node = same_physical_device
-        ? find_video_node_by_interface(device, app->selected_node_interface) : NULL;
+        ? find_video_node_by_interface(device, app->prefs->selected_node_interface) : NULL;
     if (node == NULL)
         node = first_video_node(device);
     if (device->usb_vid != 0x345f || device->usb_pid != 0x2130)
-        g_clear_pointer(&app->legacy_mode_key, g_free);
-    g_free(app->selected_video_device_id);
-    app->selected_video_device_id = g_strdup(device->stable_id);
-    g_free(app->selected_video_parent_path);
-    app->selected_video_parent_path = g_strdup(device->physical_sysfs);
-    g_free(app->selected_node_interface);
-    app->selected_node_interface = node != NULL
+        g_clear_pointer(&app->prefs->legacy_mode_key, g_free);
+    g_free(app->prefs->selected_video_device_id);
+    app->prefs->selected_video_device_id = g_strdup(device->stable_id);
+    g_free(app->prefs->selected_video_parent_path);
+    app->prefs->selected_video_parent_path = g_strdup(device->physical_sysfs);
+    g_free(app->prefs->selected_node_interface);
+    app->prefs->selected_node_interface = node != NULL
         ? g_strdup(node->interface_sysfs) : NULL;
-    app_schedule_preference_save(app);
+    capture_preferences_schedule_save(app->preferences);
     set_video_source(app, device, node);
     refresh_audio_source(app);
     populate_video_devices(app);
@@ -1593,9 +1488,9 @@ video_node_changed(GtkComboBox *combo, gpointer user_data)
         find_video_node_by_interface(app->video_device, interface_id);
     if (node == NULL || node == app->video_node)
         return;
-    g_free(app->selected_node_interface);
-    app->selected_node_interface = g_strdup(node->interface_sysfs);
-    app_schedule_preference_save(app);
+    g_free(app->prefs->selected_node_interface);
+    app->prefs->selected_node_interface = g_strdup(node->interface_sysfs);
+    capture_preferences_schedule_save(app->preferences);
     set_video_source(app, app->video_device, node);
     app_restart_pipeline(app);
 }
@@ -1606,8 +1501,8 @@ advanced_sources_toggled(GtkToggleButton *button, gpointer user_data)
     AppState *app = user_data;
     if (app->updating_controls)
         return;
-    app->include_advanced_sources = gtk_toggle_button_get_active(button);
-    app_schedule_preference_save(app);
+    app->prefs->include_advanced_sources = gtk_toggle_button_get_active(button);
+    capture_preferences_schedule_save(app->preferences);
     populate_video_devices(app);
 }
 
@@ -1618,12 +1513,13 @@ audio_selection_changed(GtkComboBox *combo, gpointer user_data)
     const gchar *selection = gtk_combo_box_get_active_id(combo);
     if (app->updating_controls || selection == NULL)
         return;
-    g_free(app->audio_selection_id);
-    app->audio_selection_id = g_strdup(selection);
-    app->audio_selection_session_only = g_str_has_prefix(selection, "session:");
-    app_schedule_preference_save(app);
+    g_free(app->prefs->audio_selection_id);
+    app->prefs->audio_selection_id = g_strdup(selection);
+    app->prefs->audio_selection_session_only =
+        g_str_has_prefix(selection, "session:");
+    capture_preferences_schedule_save(app->preferences);
     gboolean audio_changed = refresh_audio_source(app);
-    if (audio_changed && app->audio_enabled)
+    if (audio_changed && app->prefs->audio_enabled)
         app_restart_pipeline(app);
 }
 
@@ -1633,9 +1529,9 @@ audio_toggled(GtkToggleButton *button, gpointer user_data)
     AppState *app = user_data;
     if (app->updating_controls)
         return;
-    app->audio_enabled = gtk_toggle_button_get_active(button);
-    app_schedule_preference_save(app);
-    app_log(app, "Capture audio %s", app->audio_enabled ? "enabled" : "disabled");
+    app->prefs->audio_enabled = gtk_toggle_button_get_active(button);
+    capture_preferences_schedule_save(app->preferences);
+    app_log(app, "Capture audio %s", app->prefs->audio_enabled ? "enabled" : "disabled");
     app_restart_pipeline(app);
 }
 
@@ -1650,12 +1546,15 @@ scaling_mode_changed(GtkComboBox *combo, gpointer user_data)
     CaptureRendererScaleMode mode =
         g_strcmp0(mode_id, "fill") == 0 ? CAPTURE_RENDERER_FILL
                                         : CAPTURE_RENDERER_FIT;
-    if (mode == app->scale_mode)
+    CapturePreferencesScaleMode preference_mode =
+        mode == CAPTURE_RENDERER_FILL ? CAPTURE_PREFERENCES_SCALE_FILL
+                                      : CAPTURE_PREFERENCES_SCALE_FIT;
+    if (preference_mode == app->prefs->scale_mode)
         return;
 
-    app->scale_mode = mode;
+    app->prefs->scale_mode = preference_mode;
     capture_renderer_set_scale_mode(app->renderer, mode);
-    app_schedule_preference_save(app);
+    capture_preferences_schedule_save(app->preferences);
     app_log(app, "Video scaling mode set to %s",
             mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
 }
@@ -1664,17 +1563,17 @@ static void
 volume_changed(GtkRange *range, gpointer user_data)
 {
     AppState *app = user_data;
-    app->volume = gtk_range_get_value(range);
+    app->prefs->volume = gtk_range_get_value(range);
     if (app->pipeline != NULL)
-        capture_pipeline_set_volume(app->pipeline, app->volume);
-    app_schedule_preference_save(app);
+        capture_pipeline_set_volume(app->pipeline, app->prefs->volume);
+    capture_preferences_schedule_save(app->preferences);
 }
 
 static gboolean
 interaction_holds_panel(AppState *app)
 {
     GtkWidget *grab = gtk_grab_get_current();
-    return app->pinned || app->panel_pointer_inside || app->edge_hotspot_inside ||
+    return app->prefs->pinned || app->panel_pointer_inside || app->edge_hotspot_inside ||
         app->settings_open || app->mode_popup_open || app->interaction_active ||
         (grab != NULL && grab != app->window) ||
         g_get_monotonic_time() < app->keyboard_active_until_us;
@@ -1709,7 +1608,7 @@ app_schedule_panel_hide(AppState *app)
         g_source_remove(app->panel_hide_watch_id);
     if (!app->panel_visible)
         return;
-    app->panel_hide_watch_id = g_timeout_add(app->panel_hide_delay_ms,
+    app->panel_hide_watch_id = g_timeout_add(app->prefs->panel_hide_delay_ms,
                                              panel_hide_timeout, app);
 }
 
@@ -1732,7 +1631,7 @@ app_show_control_panel(AppState *app)
 static void
 app_hide_control_panel(AppState *app)
 {
-    if (app->pinned || app->panel_pointer_inside || app->edge_hotspot_inside ||
+    if (app->prefs->pinned || app->panel_pointer_inside || app->edge_hotspot_inside ||
         app->settings_open || app->mode_popup_open || app->interaction_active)
         return;
     app->panel_visible = FALSE;
@@ -1749,7 +1648,7 @@ window_motion(GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
         app->edge_hotspot_inside = at_edge;
         if (at_edge) {
             if (!app->panel_visible && app->dwell_watch_id == 0)
-                app->dwell_watch_id = g_timeout_add(app->panel_dwell_ms,
+                app->dwell_watch_id = g_timeout_add(app->prefs->panel_dwell_ms,
                                                     panel_dwell_timeout, app);
             else
                 app_show_control_panel(app);
@@ -1883,7 +1782,7 @@ key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data)
         }
         if (app->fullscreen)
             toggle_fullscreen(app);
-        if (!app->pinned) {
+        if (!app->prefs->pinned) {
             if (app->panel_hide_watch_id != 0) {
                 g_source_remove(app->panel_hide_watch_id);
                 app->panel_hide_watch_id = 0;
@@ -1931,10 +1830,10 @@ static void
 pin_toggled(GtkToggleButton *button, gpointer user_data)
 {
     AppState *app = user_data;
-    app->pinned = gtk_toggle_button_get_active(button);
-    gtk_button_set_label(GTK_BUTTON(button), app->pinned ? "Pinned" : "Pin");
-    app_schedule_preference_save(app);
-    if (app->pinned)
+    app->prefs->pinned = gtk_toggle_button_get_active(button);
+    gtk_button_set_label(GTK_BUTTON(button), app->prefs->pinned ? "Pinned" : "Pin");
+    capture_preferences_schedule_save(app->preferences);
+    if (app->prefs->pinned)
         app_show_control_panel(app);
     else
         app_schedule_panel_hide(app);
@@ -1944,28 +1843,28 @@ static void
 stats_toggled(GtkToggleButton *button, gpointer user_data)
 {
     AppState *app = user_data;
-    app->stats_visible = gtk_toggle_button_get_active(button);
-    if (app->stats_visible)
+    app->prefs->stats_visible = gtk_toggle_button_get_active(button);
+    if (app->prefs->stats_visible)
         gtk_widget_show(app->stats_overlay_box);
     else
         gtk_widget_hide(app->stats_overlay_box);
-    app_schedule_preference_save(app);
+    capture_preferences_schedule_save(app->preferences);
 }
 
 static void
 dwell_changed(GtkSpinButton *spin, gpointer user_data)
 {
     AppState *app = user_data;
-    app->panel_dwell_ms = (guint)gtk_spin_button_get_value_as_int(spin);
-    app_schedule_preference_save(app);
+    app->prefs->panel_dwell_ms = (guint)gtk_spin_button_get_value_as_int(spin);
+    capture_preferences_schedule_save(app->preferences);
 }
 
 static void
 hide_delay_changed(GtkSpinButton *spin, gpointer user_data)
 {
     AppState *app = user_data;
-    app->panel_hide_delay_ms = (guint)gtk_spin_button_get_value_as_int(spin);
-    app_schedule_preference_save(app);
+    app->prefs->panel_hide_delay_ms = (guint)gtk_spin_button_get_value_as_int(spin);
+    capture_preferences_schedule_save(app->preferences);
 }
 
 static gboolean
@@ -1984,7 +1883,7 @@ slider_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
 {
     AppState *app = user_data;
     app->interaction_active = FALSE;
-    app_schedule_preference_save(app);
+    capture_preferences_schedule_save(app->preferences);
     app_schedule_panel_hide(app);
     (void)widget;
     (void)event;
@@ -2059,12 +1958,13 @@ create_settings(AppState *app)
 
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Show controls after"), 0, 8, 1, 1);
     app->dwell_spin = gtk_spin_button_new_with_range(100, 250, 10);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->dwell_spin), app->panel_dwell_ms);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->dwell_spin), app->prefs->panel_dwell_ms);
     gtk_grid_attach(GTK_GRID(grid), app->dwell_spin, 1, 8, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("ms pointer dwell"), 2, 8, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Hide controls after"), 0, 9, 1, 1);
     app->hide_delay_spin = gtk_spin_button_new_with_range(500, 1000, 50);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->hide_delay_spin), app->panel_hide_delay_ms);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->hide_delay_spin),
+                              app->prefs->panel_hide_delay_ms);
     gtk_grid_attach(GTK_GRID(grid), app->hide_delay_spin, 1, 9, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("ms outside panel"), 2, 9, 1, 1);
 
@@ -2076,7 +1976,8 @@ create_settings(AppState *app)
                               "fill", "Fill screen, crop edges");
     app->updating_controls = TRUE;
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->scale_combo),
-                                app->scale_mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
+                                app->prefs->scale_mode == CAPTURE_PREFERENCES_SCALE_FILL
+                                    ? "fill" : "fit");
     app->updating_controls = FALSE;
     gtk_widget_set_size_request(app->scale_combo, 260, 48);
     gtk_grid_attach(GTK_GRID(grid), app->scale_combo, 1, 10, 2, 1);
@@ -2086,7 +1987,8 @@ create_settings(AppState *app)
     app->advanced_sources_check =
         gtk_check_button_new_with_label("Show internal/virtual video sources");
     gtk_toggle_button_set_active(
-        GTK_TOGGLE_BUTTON(app->advanced_sources_check), app->include_advanced_sources);
+        GTK_TOGGLE_BUTTON(app->advanced_sources_check),
+        app->prefs->include_advanced_sources);
     gtk_grid_attach(GTK_GRID(grid), app->advanced_sources_check, 0, 11, 3, 1);
     g_signal_connect(app->advanced_sources_check, "toggled",
                      G_CALLBACK(advanced_sources_toggled), app);
@@ -2225,8 +2127,8 @@ create_control_panel(AppState *app)
                      G_CALLBACK(mode_popup_notify), app);
 
     GtkWidget *pin = gtk_toggle_button_new_with_label("Pin");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(pin), app->pinned);
-    gtk_button_set_label(GTK_BUTTON(pin), app->pinned ? "Pinned" : "Pin");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(pin), app->prefs->pinned);
+    gtk_button_set_label(GTK_BUTTON(pin), app->prefs->pinned ? "Pinned" : "Pin");
     gtk_widget_set_size_request(pin, 72, 48);
     gtk_flow_box_insert(GTK_FLOW_BOX(controls), pin, -1);
     g_signal_connect(pin, "toggled", G_CALLBACK(pin_toggled), app);
@@ -2239,7 +2141,7 @@ create_control_panel(AppState *app)
     app->volume_scale =
         gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 1.0, 0.01);
     gtk_widget_set_size_request(app->volume_scale, 140, 48);
-    gtk_range_set_value(GTK_RANGE(app->volume_scale), app->volume);
+    gtk_range_set_value(GTK_RANGE(app->volume_scale), app->prefs->volume);
     gtk_scale_set_draw_value(GTK_SCALE(app->volume_scale), TRUE);
     gtk_flow_box_insert(GTK_FLOW_BOX(controls), app->volume_scale, -1);
     gtk_widget_add_events(app->volume_scale,
@@ -2251,7 +2153,7 @@ create_control_panel(AppState *app)
     g_signal_connect(app->volume_scale, "value-changed",
                      G_CALLBACK(volume_changed), app);
     GtkWidget *stats = gtk_toggle_button_new_with_label("Stats");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(stats), app->stats_visible);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(stats), app->prefs->stats_visible);
     gtk_widget_set_size_request(stats, 88, 48);
     gtk_flow_box_insert(GTK_FLOW_BOX(controls), stats, -1);
     g_signal_connect(stats, "toggled", G_CALLBACK(stats_toggled), app);
@@ -2312,7 +2214,7 @@ create_control_panel(AppState *app)
     g_object_unref(stats_css);
     gtk_overlay_add_overlay(GTK_OVERLAY(app->root_overlay), app->stats_overlay_box);
     gtk_widget_set_no_show_all(app->stats_overlay_box, TRUE);
-    if (app->stats_visible)
+    if (app->prefs->stats_visible)
         gtk_widget_show(app->stats_overlay_box);
     else
         gtk_widget_hide(app->stats_overlay_box);
@@ -2352,18 +2254,18 @@ populate_video_devices(AppState *app)
     gboolean selected_present = FALSE;
     for (guint i = 0; app->video_devices != NULL && i < app->video_devices->len; i++) {
         CaptureDevice *device = g_ptr_array_index(app->video_devices, i);
-        if (g_strcmp0(device->stable_id, app->selected_video_device_id) == 0)
+        if (g_strcmp0(device->stable_id, app->prefs->selected_video_device_id) == 0)
             selected_present = TRUE;
     }
-    if (app->selected_video_device_id != NULL && !selected_present)
+    if (app->prefs->selected_video_device_id != NULL && !selected_present)
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->source_combo),
-                                  app->selected_video_device_id,
+                                  app->prefs->selected_video_device_id,
                                   "Saved source unavailable");
     for (guint i = 0; app->video_devices != NULL && i < app->video_devices->len; i++) {
         CaptureDevice *device = g_ptr_array_index(app->video_devices, i);
         gboolean selected = g_strcmp0(device->stable_id,
-                                      app->selected_video_device_id) == 0;
-        if (device->usb_sysfs == NULL && !app->include_advanced_sources && !selected)
+                                      app->prefs->selected_video_device_id) == 0;
+        if (device->usb_sysfs == NULL && !app->prefs->include_advanced_sources && !selected)
             continue;
         gchar *label = device->usb_sysfs != NULL
             ? g_strdup(device->display_name)
@@ -2376,9 +2278,9 @@ populate_video_devices(AppState *app)
                                   device->stable_id, label);
         g_free(label);
     }
-    if (app->selected_video_device_id != NULL)
+    if (app->prefs->selected_video_device_id != NULL)
         gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->source_combo),
-                                    app->selected_video_device_id);
+                                    app->prefs->selected_video_device_id);
     else
         gtk_combo_box_set_active(GTK_COMBO_BOX(app->source_combo), -1);
 
@@ -2403,7 +2305,7 @@ populate_video_devices(AppState *app)
         interface_count++;
     }
     const gchar *node_id = app->video_node != NULL
-        ? app->video_node->interface_sysfs : app->selected_node_interface;
+        ? app->video_node->interface_sysfs : app->prefs->selected_node_interface;
     if (node_id != NULL)
         gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->node_combo), node_id);
     else if (interface_count > 0)
@@ -2515,7 +2417,10 @@ app_activate(GtkApplication *application, gpointer user_data)
         g_application_quit(G_APPLICATION(application));
         return;
     }
-    capture_renderer_set_scale_mode(app->renderer, app->scale_mode);
+    capture_renderer_set_scale_mode(
+        app->renderer,
+        app->prefs->scale_mode == CAPTURE_PREFERENCES_SCALE_FILL
+            ? CAPTURE_RENDERER_FILL : CAPTURE_RENDERER_FIT);
     capture_renderer_connect_motion_events(app->renderer, window_motion, app);
     CapturePipelineCallbacks pipeline_callbacks = {
         .log_message = pipeline_log_message,
@@ -2538,7 +2443,7 @@ app_activate(GtkApplication *application, gpointer user_data)
     gtk_widget_show_all(app->window);
     gtk_widget_hide(app->settings);
     gtk_widget_hide(app->control_panel);
-    if (app->pinned)
+    if (app->prefs->pinned)
         app_show_control_panel(app);
     gtk_widget_realize(app->window);
     gtk_widget_grab_focus(app->window);
@@ -2580,9 +2485,7 @@ app_shutdown(GApplication *application, gpointer user_data)
         g_source_remove(app->dwell_watch_id);
     if (app->panel_hide_watch_id != 0)
         g_source_remove(app->panel_hide_watch_id);
-    if (app->config_save_watch_id != 0)
-        g_source_remove(app->config_save_watch_id);
-    app_save_preferences(app);
+    capture_preferences_save(app->preferences);
     if (app->monitor_watch_id != 0)
         g_source_remove(app->monitor_watch_id);
     if (app->stats_watch_id != 0)
@@ -2608,17 +2511,11 @@ app_shutdown(GApplication *application, gpointer user_data)
     if (app->video_devices != NULL)
         g_ptr_array_unref(app->video_devices);
     g_free(app->audio_device_id);
-    g_free(app->audio_selection_id);
     g_free(app->audio_selection_status);
     g_free(app->audio_display_name);
     g_free(app->audio_sink_name);
     g_free(app->audio_sink_id);
-    g_free(app->selected_video_device_id);
-    g_free(app->selected_video_parent_path);
-    g_free(app->selected_node_interface);
-    g_free(app->legacy_mode_key);
-    g_hash_table_unref(app->mode_preferences);
-    g_free(app->config_path);
+    capture_preferences_free(app->preferences);
     g_free(app->pipeline_error);
     g_free(app->renderer_backend_logged);
     app_log(app, "Viewer shut down cleanly");
@@ -2696,118 +2593,11 @@ main(int argc, char **argv)
     if (argc > 1 && g_str_equal(argv[1], "--list-modes"))
         return list_modes();
     AppState app = {0};
-    app.mode_preferences = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    app.preferences = capture_preferences_new();
+    app.prefs = capture_preferences_get_values(app.preferences);
     g_mutex_init(&app.log_mutex);
-    app.audio_enabled = TRUE;
-    app.audio_selection_id = g_strdup("auto");
-    app.volume = 0.8;
-    app.panel_dwell_ms = 150;
-    app.panel_hide_delay_ms = 700;
-    app.config_path = g_build_filename(g_get_user_config_dir(), "captureviewer",
-                                       "config.ini", NULL);
     app.log_path = g_build_filename(g_get_user_data_dir(), "captureviewer",
                                     "captureviewer.log", NULL);
-    gchar *legacy_config_path = g_build_filename(g_get_user_config_dir(),
-                                                  "hagibis-viewer", "config.ini", NULL);
-    gboolean new_config_exists = g_file_test(app.config_path, G_FILE_TEST_EXISTS);
-    GKeyFile *key_file = g_key_file_new();
-    gboolean config_loaded = g_key_file_load_from_file(
-        key_file, new_config_exists ? app.config_path : legacy_config_path,
-        G_KEY_FILE_NONE, NULL);
-    if (config_loaded && !new_config_exists) {
-        gsize length = 0;
-        gchar *contents = g_key_file_to_data(key_file, &length, NULL);
-        gchar *directory = g_path_get_dirname(app.config_path);
-        if (g_mkdir_with_parents(directory, 0700) != 0 ||
-            !g_file_set_contents(app.config_path, contents, (gssize)length, NULL))
-            g_warning("Could not migrate existing preferences to %s", app.config_path);
-        g_free(directory);
-        g_free(contents);
-    }
-    if (config_loaded) {
-        if (g_key_file_has_key(key_file, "capture", "device-id", NULL)) {
-            gchar *stored_id =
-                g_key_file_get_string(key_file, "capture", "device-id", NULL);
-            if (stored_id != NULL && *stored_id != '\0')
-                app.selected_video_device_id = stored_id;
-            else
-                g_free(stored_id);
-        }
-        if (g_key_file_has_key(key_file, "capture", "device-parent", NULL))
-            app.selected_video_parent_path =
-                g_key_file_get_string(key_file, "capture", "device-parent", NULL);
-        if (g_key_file_has_key(key_file, "capture", "node-id", NULL))
-            app.selected_node_interface =
-                g_key_file_get_string(key_file, "capture", "node-id", NULL);
-        if (g_key_file_has_key(key_file, "capture", "advanced-sources", NULL))
-            app.include_advanced_sources =
-                g_key_file_get_boolean(key_file, "capture", "advanced-sources", NULL);
-        if (app.selected_video_device_id == NULL &&
-            g_key_file_has_key(key_file, "capture", "mode", NULL)) {
-            gchar *legacy_mode =
-                g_key_file_get_string(key_file, "capture", "mode", NULL);
-            if (legacy_mode != NULL && *legacy_mode != '\0')
-                app.legacy_mode_key = legacy_mode;
-            else
-                g_free(legacy_mode);
-        }
-        if (g_key_file_has_group(key_file, "capture-modes")) {
-            GError *mode_error = NULL;
-            gsize mode_count = 0;
-            gchar **digests =
-                g_key_file_get_keys(key_file, "capture-modes", &mode_count,
-                                    &mode_error);
-            if (digests != NULL) {
-                for (gsize i = 0; i < mode_count; i++) {
-                    gchar *mode_key = g_key_file_get_string(
-                        key_file, "capture-modes", digests[i], NULL);
-                    if (mode_key != NULL)
-                        g_hash_table_replace(app.mode_preferences,
-                                             g_strdup(digests[i]), mode_key);
-                }
-                g_strfreev(digests);
-            }
-            g_clear_error(&mode_error);
-        }
-        if (g_key_file_has_key(key_file, "audio", "enabled", NULL))
-            app.audio_enabled = g_key_file_get_boolean(key_file, "audio", "enabled", NULL);
-        if (g_key_file_has_key(key_file, "audio", "source-id", NULL)) {
-            gchar *stored_audio =
-                g_key_file_get_string(key_file, "audio", "source-id", NULL);
-            if (stored_audio != NULL && *stored_audio != '\0') {
-                g_free(app.audio_selection_id);
-                app.audio_selection_id = stored_audio;
-            } else {
-                g_free(stored_audio);
-            }
-        }
-        if (g_key_file_has_key(key_file, "audio", "volume", NULL)) {
-            gdouble stored_volume = g_key_file_get_double(key_file, "audio", "volume", NULL);
-            if (stored_volume >= 0.0 && stored_volume <= 1.0)
-                app.volume = stored_volume;
-        }
-        if (g_key_file_has_key(key_file, "ui", "panel-pinned", NULL))
-            app.pinned = g_key_file_get_boolean(key_file, "ui", "panel-pinned", NULL);
-        if (g_key_file_has_key(key_file, "ui", "stats-visible", NULL))
-            app.stats_visible = g_key_file_get_boolean(key_file, "ui", "stats-visible", NULL);
-        if (g_key_file_has_key(key_file, "ui", "dwell-ms", NULL)) {
-            gint dwell = g_key_file_get_integer(key_file, "ui", "dwell-ms", NULL);
-            if (dwell >= 100 && dwell <= 250)
-                app.panel_dwell_ms = (guint)dwell;
-        }
-        if (g_key_file_has_key(key_file, "ui", "hide-delay-ms", NULL)) {
-            gint delay = g_key_file_get_integer(key_file, "ui", "hide-delay-ms", NULL);
-            if (delay >= 500 && delay <= 1000)
-                app.panel_hide_delay_ms = (guint)delay;
-        }
-        gchar *stored_scale_mode =
-            g_key_file_get_string(key_file, "ui", "scaling-mode", NULL);
-        app.scale_mode = g_strcmp0(stored_scale_mode, "fill") == 0
-            ? CAPTURE_RENDERER_FILL : CAPTURE_RENDERER_FIT;
-        g_free(stored_scale_mode);
-    }
-    g_free(legacy_config_path);
-    g_key_file_unref(key_file);
     GtkApplication *application = gtk_application_new("io.github.wully616.captureviewer",
                                                        G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "activate", G_CALLBACK(app_activate), &app);

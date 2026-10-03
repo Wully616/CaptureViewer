@@ -63,6 +63,10 @@ Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/
 
 *Development UI screenshot from the Steam Frame desktop with the tested Hagibis USB device detected but no UVC video interface bound. The black video area is expected in this driver-unavailable state; no capture stream was running.*
 
+## Architecture
+
+`src/main.c` coordinates the GTK application, UI, and audio-device matching. `src/capture.c` owns V4L2/sysfs discovery, `src/renderer.c` owns the video surface, `src/pipeline.c` owns GStreamer capture/playback lifecycle, and `src/preferences.c` owns configuration defaults, migration, and persistence. Pipeline and preferences internals are hidden behind module APIs; preference values are exposed to the application as a borrowed view.
+
 ## Build dependencies
 
 A C11 compiler, Meson (0.60 or newer), Ninja, and pkg-config are needed, along with development packages discoverable via pkg-config for:
