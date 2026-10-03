@@ -32,6 +32,7 @@ viewer = executable(
   'captureviewer',
   [
     'src/main.c',
+    'src/app.c',
     'src/capture.c',
     'src/renderer.c',
     'src/pipeline.c',
