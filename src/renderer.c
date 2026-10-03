@@ -24,14 +24,23 @@ struct _CaptureRenderer {
     guint pixel_aspect_num;
     guint pixel_aspect_den;
     GLuint texture;
+    GLuint chroma_u_texture;
+    GLuint chroma_v_texture;
     GLuint program;
     GLuint vertex_array;
     GLuint vertex_buffer;
     GLint position_location;
     GLint texcoord_location;
+    GLint chroma_u_sampler_location;
+    GLint chroma_v_sampler_location;
+    GLint use_i420_location;
+    GLint yuv_offset_location;
+    GLint yuv_scale_location;
+    GLint yuv_coefficients_location;
     GLint sampler_location;
     guint texture_width;
     guint texture_height;
+    GstVideoFormat texture_format;
     CaptureRendererScaleMode scale_mode;
     gboolean dispatch_pending;
     gboolean closing;
@@ -79,9 +88,28 @@ create_gl_resources(CaptureRenderer *renderer, GError **error)
     static const gchar *fragment_source =
         "#version 150\n"
         "uniform sampler2D frame_texture;\n"
+        "uniform sampler2D frame_u_texture;\n"
+        "uniform sampler2D frame_v_texture;\n"
+        "uniform int use_i420;\n"
+        "uniform vec3 yuv_offset;\n"
+        "uniform vec3 yuv_scale;\n"
+        "uniform vec4 yuv_coefficients;\n"
         "in vec2 frame_texcoord;\n"
         "out vec4 color;\n"
-        "void main() { color = texture(frame_texture, frame_texcoord); }\n";
+        "void main() {\n"
+        "    if (use_i420 == 0) {\n"
+        "        color = texture(frame_texture, frame_texcoord);\n"
+        "    } else {\n"
+        "        vec3 yuv = vec3(texture(frame_texture, frame_texcoord).r,\n"
+        "                        texture(frame_u_texture, frame_texcoord).r,\n"
+        "                        texture(frame_v_texture, frame_texcoord).r);\n"
+        "        yuv = (yuv - yuv_offset) * yuv_scale;\n"
+        "        color = vec4(yuv.x + yuv_coefficients.x * yuv.z,\n"
+        "                     yuv.x + yuv_coefficients.y * yuv.y + "
+        "yuv_coefficients.z * yuv.z,\n"
+        "                     yuv.x + yuv_coefficients.w * yuv.y, 1.0);\n"
+        "    }\n"
+        "}\n";
 
     GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source, error);
     if (vertex == 0)
@@ -119,14 +147,33 @@ create_gl_resources(CaptureRenderer *renderer, GError **error)
     renderer->position_location = glGetAttribLocation(renderer->program, "position");
     renderer->texcoord_location = glGetAttribLocation(renderer->program, "texcoord");
     renderer->sampler_location = glGetUniformLocation(renderer->program, "frame_texture");
+    renderer->chroma_u_sampler_location =
+        glGetUniformLocation(renderer->program, "frame_u_texture");
+    renderer->chroma_v_sampler_location =
+        glGetUniformLocation(renderer->program, "frame_v_texture");
+    renderer->use_i420_location =
+        glGetUniformLocation(renderer->program, "use_i420");
+    renderer->yuv_offset_location =
+        glGetUniformLocation(renderer->program, "yuv_offset");
+    renderer->yuv_scale_location =
+        glGetUniformLocation(renderer->program, "yuv_scale");
+    renderer->yuv_coefficients_location =
+        glGetUniformLocation(renderer->program, "yuv_coefficients");
     glGenVertexArrays(1, &renderer->vertex_array);
     glGenBuffers(1, &renderer->vertex_buffer);
     glGenTextures(1, &renderer->texture);
-    glBindTexture(GL_TEXTURE_2D, renderer->texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenTextures(1, &renderer->chroma_u_texture);
+    glGenTextures(1, &renderer->chroma_v_texture);
+    GLuint textures[] = {
+        renderer->texture, renderer->chroma_u_texture, renderer->chroma_v_texture
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(textures); i++) {
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     glBindTexture(GL_TEXTURE_2D, 0);
     renderer->gl_initialized = TRUE;
     return TRUE;
@@ -140,10 +187,25 @@ set_backend_name(CaptureRenderer *renderer, const gchar *name)
 }
 
 static void
+set_sink_format(CaptureRenderer *renderer, GstVideoFormat format)
+{
+    if (renderer->sink == NULL)
+        return;
+
+    GstCaps *caps = gst_caps_new_simple("video/x-raw",
+                                        "format", G_TYPE_STRING,
+                                        gst_video_format_to_string(format),
+                                        NULL);
+    g_object_set(renderer->sink, "caps", caps, NULL);
+    gst_caps_unref(caps);
+}
+
+static void
 use_cairo_fallback(CaptureRenderer *renderer, const gchar *reason)
 {
     g_warning("CaptureRenderer: GtkGLArea unavailable (%s); using Cairo", reason);
     set_backend_name(renderer, "GtkDrawingArea/Cairo");
+    set_sink_format(renderer, GST_VIDEO_FORMAT_RGBA);
     gtk_stack_set_visible_child(GTK_STACK(renderer->stack), renderer->cairo_area);
     gtk_widget_queue_draw(renderer->cairo_area);
 }
@@ -165,6 +227,7 @@ on_gl_realize(GtkGLArea *area, gpointer user_data)
         return;
     }
 
+    set_sink_format(renderer, GST_VIDEO_FORMAT_I420);
     const gchar *vendor = (const gchar *)glGetString(GL_VENDOR);
     const gchar *name = (const gchar *)glGetString(GL_RENDERER);
     const gchar *version = (const gchar *)glGetString(GL_VERSION);
@@ -190,11 +253,15 @@ on_gl_unrealize(GtkGLArea *area, gpointer user_data)
     gtk_gl_area_make_current(area);
     if (gtk_gl_area_get_error(area) == NULL) {
         glDeleteTextures(1, &renderer->texture);
+        glDeleteTextures(1, &renderer->chroma_u_texture);
+        glDeleteTextures(1, &renderer->chroma_v_texture);
         glDeleteBuffers(1, &renderer->vertex_buffer);
         glDeleteVertexArrays(1, &renderer->vertex_array);
         glDeleteProgram(renderer->program);
     }
     renderer->texture = 0;
+    renderer->chroma_u_texture = 0;
+    renderer->chroma_v_texture = 0;
     renderer->vertex_buffer = 0;
     renderer->vertex_array = 0;
     renderer->program = 0;
@@ -279,14 +346,68 @@ get_latest_sample(CaptureRenderer *renderer, guint64 *generation)
 }
 
 static gboolean
-map_rgba_sample(GstSample *sample, GstVideoInfo *info, GstVideoFrame *frame)
+map_video_sample(GstSample *sample, GstVideoInfo *info, GstVideoFrame *frame)
 {
     GstCaps *caps = gst_sample_get_caps(sample);
     GstBuffer *buffer = gst_sample_get_buffer(sample);
-    if (caps == NULL || buffer == NULL || !gst_video_info_from_caps(info, caps) ||
-        GST_VIDEO_INFO_FORMAT(info) != GST_VIDEO_FORMAT_RGBA)
+    if (caps == NULL || buffer == NULL || !gst_video_info_from_caps(info, caps))
+        return FALSE;
+    GstVideoFormat format = GST_VIDEO_INFO_FORMAT(info);
+    if (format != GST_VIDEO_FORMAT_RGBA && format != GST_VIDEO_FORMAT_I420)
         return FALSE;
     return gst_video_frame_map(frame, info, buffer, GST_MAP_READ);
+}
+
+static gboolean
+upload_i420_frame(CaptureRenderer *renderer, const GstVideoInfo *info,
+                  const GstVideoFrame *frame)
+{
+    guint width = GST_VIDEO_INFO_WIDTH(info);
+    guint height = GST_VIDEO_INFO_HEIGHT(info);
+    guint chroma_width = GST_VIDEO_FRAME_COMP_WIDTH(frame, 1);
+    guint chroma_height = GST_VIDEO_FRAME_COMP_HEIGHT(frame, 1);
+    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
+    gint u_stride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 1);
+    gint v_stride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 2);
+    if (y_stride < (gint)width || u_stride < (gint)chroma_width ||
+        v_stride < (gint)chroma_width)
+        return FALSE;
+
+    gboolean reallocate = width != renderer->texture_width ||
+        height != renderer->texture_height ||
+        renderer->texture_format != GST_VIDEO_FORMAT_I420;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D, renderer->texture);
+    if (reallocate)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)width,
+                     (GLsizei)height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, y_stride);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
+                    (GLsizei)height, GL_RED, GL_UNSIGNED_BYTE,
+                    GST_VIDEO_FRAME_PLANE_DATA(frame, 0));
+
+    glBindTexture(GL_TEXTURE_2D, renderer->chroma_u_texture);
+    if (reallocate)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)chroma_width,
+                     (GLsizei)chroma_height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, u_stride);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)chroma_width,
+                    (GLsizei)chroma_height, GL_RED, GL_UNSIGNED_BYTE,
+                    GST_VIDEO_FRAME_PLANE_DATA(frame, 1));
+
+    glBindTexture(GL_TEXTURE_2D, renderer->chroma_v_texture);
+    if (reallocate)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)chroma_width,
+                     (GLsizei)chroma_height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, v_stride);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)chroma_width,
+                    (GLsizei)chroma_height, GL_RED, GL_UNSIGNED_BYTE,
+                    GST_VIDEO_FRAME_PLANE_DATA(frame, 2));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    renderer->texture_width = width;
+    renderer->texture_height = height;
+    renderer->texture_format = GST_VIDEO_FORMAT_I420;
+    return TRUE;
 }
 
 static gboolean
@@ -338,31 +459,43 @@ on_gl_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
 
     GstVideoInfo info;
     GstVideoFrame frame;
-    if (!map_rgba_sample(sample, &info, &frame)) {
+    if (!map_video_sample(sample, &info, &frame)) {
         gst_sample_unref(sample);
         return TRUE;
     }
 
     guint width = GST_VIDEO_INFO_WIDTH(&info);
     guint height = GST_VIDEO_INFO_HEIGHT(&info);
+    GstVideoFormat format = GST_VIDEO_INFO_FORMAT(&info);
     if (generation != renderer->uploaded_generation ||
-        width != renderer->texture_width || height != renderer->texture_height) {
-        gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
-        const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
-        if (stride > 0 && stride % 4 == 0) {
-            glBindTexture(GL_TEXTURE_2D, renderer->texture);
-            if (width != renderer->texture_width || height != renderer->texture_height) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width,
-                             (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                renderer->texture_width = width;
-                renderer->texture_height = height;
+        width != renderer->texture_width || height != renderer->texture_height ||
+        format != renderer->texture_format) {
+        if (format == GST_VIDEO_FORMAT_I420) {
+            if (upload_i420_frame(renderer, &info, &frame))
+                renderer->uploaded_generation = generation;
+        } else {
+            gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+            const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
+            if (stride > 0 && stride % 4 == 0) {
+                glBindTexture(GL_TEXTURE_2D, renderer->texture);
+                if (width != renderer->texture_width ||
+                    height != renderer->texture_height ||
+                    renderer->texture_format != GST_VIDEO_FORMAT_RGBA) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width,
+                                 (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 NULL);
+                    renderer->texture_width = width;
+                    renderer->texture_height = height;
+                    renderer->texture_format = GST_VIDEO_FORMAT_RGBA;
+                }
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
+                                (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE,
+                                pixels);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                renderer->uploaded_generation = generation;
             }
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
-                            (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-            renderer->uploaded_generation = generation;
         }
     }
 
@@ -385,6 +518,44 @@ on_gl_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, renderer->texture);
         glUniform1i(renderer->sampler_location, 0);
+        glUniform1i(renderer->chroma_u_sampler_location, 1);
+        glUniform1i(renderer->chroma_v_sampler_location, 2);
+        glUniform1i(renderer->use_i420_location,
+                    format == GST_VIDEO_FORMAT_I420);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, renderer->chroma_u_texture);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, renderer->chroma_v_texture);
+        glActiveTexture(GL_TEXTURE0);
+        if (format == GST_VIDEO_FORMAT_I420) {
+            gdouble kr = 0.299;
+            gdouble kb = 0.114;
+            if (!gst_video_color_matrix_get_Kr_Kb(info.colorimetry.matrix,
+                                                  &kr, &kb)) {
+                kr = 0.299;
+                kb = 0.114;
+            }
+            gdouble kg = 1.0 - kr - kb;
+            GLfloat y_offset = 16.0f / 255.0f;
+            GLfloat uv_offset = 128.0f / 255.0f;
+            GLfloat y_scale = 255.0f / 219.0f;
+            GLfloat uv_scale = 255.0f / 224.0f;
+            if (info.colorimetry.range == GST_VIDEO_COLOR_RANGE_0_255) {
+                y_offset = 0.0f;
+                uv_offset = 0.5f;
+                y_scale = 1.0f;
+                uv_scale = 1.0f;
+            }
+            glUniform3f(renderer->yuv_offset_location, y_offset,
+                        uv_offset, uv_offset);
+            glUniform3f(renderer->yuv_scale_location, y_scale,
+                        uv_scale, uv_scale);
+            glUniform4f(renderer->yuv_coefficients_location,
+                        (GLfloat)(2.0 * (1.0 - kr)),
+                        (GLfloat)(-2.0 * kb * (1.0 - kb) / kg),
+                        (GLfloat)(-2.0 * kr * (1.0 - kr) / kg),
+                        (GLfloat)(2.0 * (1.0 - kb)));
+        }
         glBindVertexArray(renderer->vertex_array);
         glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
         glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
@@ -425,34 +596,38 @@ on_cairo_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
 
     GstVideoInfo info;
     GstVideoFrame frame;
-    if (map_rgba_sample(sample, &info, &frame)) {
-        gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
-        const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
-        CaptureRendererLayout layout;
-        if (stride > 0 && layout_for_area(renderer, widget, (guint)width,
-                                          (guint)height, &layout)) {
-            GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
-                pixels, GDK_COLORSPACE_RGB, TRUE, 8,
-                (gint)GST_VIDEO_INFO_WIDTH(&info),
-                (gint)GST_VIDEO_INFO_HEIGHT(&info), stride, NULL, NULL);
-            if (pixbuf != NULL) {
-                gdouble image_width = layout.viewport.width /
-                                      (layout.u1 - layout.u0);
-                gdouble image_height = layout.viewport.height /
-                                       (layout.v1 - layout.v0);
-                gdouble x = layout.viewport.x - layout.u0 * image_width;
-                gdouble y = layout.viewport.y - layout.v0 * image_height;
-                cairo_save(cr);
-                cairo_rectangle(cr, layout.viewport.x, layout.viewport.y,
-                                layout.viewport.width, layout.viewport.height);
-                cairo_clip(cr);
-                cairo_translate(cr, x, y);
-                cairo_scale(cr, image_width / GST_VIDEO_INFO_WIDTH(&info),
-                            image_height / GST_VIDEO_INFO_HEIGHT(&info));
-                gdk_cairo_set_source_pixbuf(cr, pixbuf, 0, 0);
-                cairo_paint(cr);
-                cairo_restore(cr);
-                g_object_unref(pixbuf);
+    if (map_video_sample(sample, &info, &frame)) {
+        if (GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_RGBA) {
+            gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+            const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
+            CaptureRendererLayout layout;
+            if (stride > 0 &&
+                layout_for_area(renderer, widget, (guint)width,
+                                (guint)height, &layout)) {
+                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
+                    pixels, GDK_COLORSPACE_RGB, TRUE, 8,
+                    (gint)GST_VIDEO_INFO_WIDTH(&info),
+                    (gint)GST_VIDEO_INFO_HEIGHT(&info), stride, NULL, NULL);
+                if (pixbuf != NULL) {
+                    gdouble image_width = layout.viewport.width /
+                                          (layout.u1 - layout.u0);
+                    gdouble image_height = layout.viewport.height /
+                                           (layout.v1 - layout.v0);
+                    gdouble x = layout.viewport.x - layout.u0 * image_width;
+                    gdouble y = layout.viewport.y - layout.v0 * image_height;
+                    cairo_save(cr);
+                    cairo_rectangle(cr, layout.viewport.x, layout.viewport.y,
+                                    layout.viewport.width, layout.viewport.height);
+                    cairo_clip(cr);
+                    cairo_translate(cr, x, y);
+                    cairo_scale(cr,
+                                image_width / GST_VIDEO_INFO_WIDTH(&info),
+                                image_height / GST_VIDEO_INFO_HEIGHT(&info));
+                    gdk_cairo_set_source_pixbuf(cr, pixbuf, 0, 0);
+                    cairo_paint(cr);
+                    cairo_restore(cr);
+                    g_object_unref(pixbuf);
+                }
             }
         }
         gst_video_frame_unmap(&frame);
@@ -488,8 +663,12 @@ on_new_sample(GstAppSink *sink, gpointer user_data)
 
     GstVideoInfo info;
     gboolean valid_caps = gst_sample_get_caps(sample) != NULL &&
-        gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) &&
-        GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_RGBA;
+        gst_video_info_from_caps(&info, gst_sample_get_caps(sample));
+    if (valid_caps) {
+        GstVideoFormat format = GST_VIDEO_INFO_FORMAT(&info);
+        valid_caps = format == GST_VIDEO_FORMAT_RGBA ||
+                     format == GST_VIDEO_FORMAT_I420;
+    }
     GstSample *old_sample = NULL;
     gboolean schedule_dispatch = FALSE;
     g_mutex_lock(&renderer->sample_mutex);
@@ -637,7 +816,8 @@ capture_renderer_create_sink(CaptureRenderer *renderer)
         return NULL;
 
     GstCaps *caps = gst_caps_new_simple("video/x-raw",
-                                        "format", G_TYPE_STRING, "RGBA",
+                                        "format", G_TYPE_STRING,
+                                        renderer->gl_initialized ? "I420" : "RGBA",
                                         NULL);
     g_object_set(sink,
                  "caps", caps,
