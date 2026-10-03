@@ -22,7 +22,6 @@ struct _CapturePipeline {
     GstElement *audio_queue;
     GstElement *video_convert;
     GstElement *fps_sink;
-    GstElement *video_sink;
     GstElement *audio_source;
     GstElement *audio_sink;
     guint bus_watch_id;
@@ -397,7 +396,6 @@ setup_video_branch(CapturePipeline *pipeline, const CaptureVideoNode *node,
     pipeline->video_queue = queue;
     pipeline->video_convert = convert;
     pipeline->fps_sink = fps;
-    pipeline->video_sink = sink;
 
     gboolean linked = FALSE;
     if (decoder == NULL) {
@@ -504,14 +502,11 @@ pipeline_stop(CapturePipeline *pipeline)
     }
     if (pipeline->bus != NULL)
         gst_object_unref(pipeline->bus);
-    if (pipeline->video_sink != NULL)
-        gst_object_unref(pipeline->video_sink);
     pipeline->pipeline = NULL;
     pipeline->bus = NULL;
     pipeline->video_queue = NULL;
     pipeline->video_convert = NULL;
     pipeline->fps_sink = NULL;
-    pipeline->video_sink = NULL;
     pipeline->audio_source = NULL;
     pipeline->audio_sink = NULL;
     pipeline->audio_queue = NULL;
