@@ -646,6 +646,8 @@ capture_pipeline_start(CapturePipeline *pipeline,
             observed, context);
         g_free(context);
         pipeline_stop(pipeline);
+        if (pipeline->callbacks.state_changed != NULL)
+            pipeline->callbacks.state_changed(pipeline->user_data);
         return FALSE;
     }
     pipeline->pipeline_started_us = g_get_monotonic_time();
