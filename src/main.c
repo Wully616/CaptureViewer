@@ -1,14 +1,13 @@
 #define _GNU_SOURCE
 #include "capture.h"
+#include "pipeline.h"
 #include "renderer.h"
-
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
 #include <gst/gst.h>
 #include <linux/videodev2.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <sys/resource.h>
 #include <time.h>
 
 
@@ -16,11 +15,6 @@
 #define MODE_DEFAULT_W 1280
 #define MODE_DEFAULT_H 720
 #define MODE_DEFAULT_FPS 60
-#define VIDEO_QUEUE_BUFFERS 1
-#define AUDIO_QUEUE_BUFFERS 4
-#define AUDIO_QUEUE_NS 50000000
-#define AUDIO_LATENCY_US 20000
-#define AUDIO_BUFFER_US 60000
 
 typedef struct AppState AppState;
 struct AppState {
@@ -77,16 +71,8 @@ struct AppState {
     gchar *log_path;
     gchar *renderer_backend_logged;
     gchar *pipeline_error;
-    GstElement *pipeline;
-    GstBus *pipeline_bus;
-    GstElement *video_queue;
-    GstElement *audio_queue;
-    GstElement *video_convert;
-    GstElement *fps_sink;
-    GstElement *video_sink;
-    GstElement *audio_source;
-    GstElement *audio_sink;
-    guint bus_watch_id;
+    CapturePipeline *pipeline;
+    CapturePipelineStats pipeline_stats;
     guint device_watch_id;
     guint monitor_watch_id;
     guint stats_watch_id;
@@ -94,20 +80,7 @@ struct AppState {
     guint panel_hide_watch_id;
     guint config_save_watch_id;
     gint64 retry_after_us;
-    gint64 pipeline_started_us;
-    gint64 last_video_frame_us;
     guint current_mode;
-    guint64 frames_dropped;
-    guint64 queue_level;
-    gdouble current_fps;
-    gdouble average_fps;
-    gdouble cpu_percent;
-    gint64 audio_source_latency_us;
-    gint64 audio_source_buffer_us;
-    gint64 latency_min_ns;
-    gint64 latency_max_ns;
-    gint64 last_cpu_us;
-    gint64 last_cpu_time_us;
     gdouble volume;
     gboolean audio_enabled;
     CaptureRendererScaleMode scale_mode;
@@ -127,7 +100,6 @@ struct AppState {
     gboolean include_advanced_sources;
     gboolean audio_selection_session_only;
     gboolean settings_open;
-    GMutex stats_mutex;
     GMutex log_mutex;
 };
 
@@ -145,18 +117,7 @@ static void create_control_panel(AppState *app);
 static void create_settings(AppState *app);
 static void populate_video_devices(AppState *app);
 static void populate_mode_selectors(AppState *app);
-static void on_fps_measurements(GstElement *element, gdouble fps, gdouble droprate,
-                                gdouble average, gpointer user_data);
 
-static gint64
-process_cpu_time_us(void)
-{
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) != 0)
-        return 0;
-    return (gint64)usage.ru_utime.tv_sec * G_USEC_PER_SEC + usage.ru_utime.tv_usec +
-           (gint64)usage.ru_stime.tv_sec * G_USEC_PER_SEC + usage.ru_stime.tv_usec;
-}
 
 static void
 app_log(AppState *app, const gchar *format, ...)
@@ -766,65 +727,6 @@ choose_default_mode(AppState *app)
     return best_index;
 }
 
-static const gchar *
-raw_gst_format(guint32 fourcc)
-{
-    switch (fourcc) {
-    case V4L2_PIX_FMT_YUYV: return "YUY2";
-    case V4L2_PIX_FMT_UYVY: return "UYVY";
-    case V4L2_PIX_FMT_YVYU: return "YVYU";
-    case V4L2_PIX_FMT_NV12: return "NV12";
-    case V4L2_PIX_FMT_NV21: return "NV21";
-    case V4L2_PIX_FMT_RGB24: return "RGB";
-    case V4L2_PIX_FMT_BGR24: return "BGR";
-    case V4L2_PIX_FMT_GREY: return "GRAY8";
-    default: return NULL;
-    }
-}
-
-static const gchar *
-compressed_gst_caps(guint32 fourcc)
-{
-    if (fourcc == V4L2_PIX_FMT_MJPEG || fourcc == V4L2_PIX_FMT_JPEG)
-        return "image/jpeg";
-    if (fourcc == V4L2_PIX_FMT_H264)
-        return "video/x-h264";
-#ifdef V4L2_PIX_FMT_HEVC
-    if (fourcc == V4L2_PIX_FMT_HEVC)
-        return "video/x-h265";
-#endif
-#ifdef V4L2_PIX_FMT_VP9
-    if (fourcc == V4L2_PIX_FMT_VP9)
-        return "video/x-vp9";
-#endif
-    return NULL;
-}
-
-static GstCaps *
-caps_for_mode(const CaptureMode *mode)
-{
-    const gchar *caps_name = mode->compressed ? compressed_gst_caps(mode->fourcc)
-                                              : "video/x-raw";
-    if (caps_name == NULL)
-        return NULL;
-    GstCaps *caps = gst_caps_new_simple(caps_name,
-        "width", G_TYPE_INT, (gint)mode->width,
-        "height", G_TYPE_INT, (gint)mode->height,
-        "framerate", GST_TYPE_FRACTION, (gint)mode->fps_n, (gint)mode->fps_d,
-        NULL);
-    if (mode->fourcc == V4L2_PIX_FMT_MJPEG || mode->fourcc == V4L2_PIX_FMT_JPEG)
-        gst_caps_set_simple(caps, "parsed", G_TYPE_BOOLEAN, TRUE, NULL);
-    else if (!mode->compressed) {
-        const gchar *format = raw_gst_format(mode->fourcc);
-        if (format == NULL) {
-            gst_caps_unref(caps);
-            return NULL;
-        }
-        gst_caps_set_simple(caps, "format", G_TYPE_STRING, format, NULL);
-    }
-    return caps;
-}
-
 static gboolean
 is_mjpeg_mode(const CaptureMode *mode)
 {
@@ -832,308 +734,76 @@ is_mjpeg_mode(const CaptureMode *mode)
 }
 
 static const gchar *
-mode_unusable_reason(const CaptureVideoNode *node, const CaptureMode *mode)
+video_buffer_type_name(enum v4l2_buf_type type)
 {
-    if (node == NULL || mode == NULL)
-        return "capture node or mode is unavailable";
-    GstCaps *caps = caps_for_mode(mode);
-    if (caps == NULL)
-        return "format has no GStreamer caps mapping";
-    if (!mode->compressed) {
-        gst_caps_unref(caps);
-        return NULL;
+    switch (type) {
+    case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+        return "VIDEO_CAPTURE";
+    case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+        return "VIDEO_CAPTURE_MPLANE";
+    default:
+        return "unknown";
     }
-    if (is_mjpeg_mode(mode)) {
-        GstElementFactory *jpeg_factory = gst_element_factory_find("jpegdec");
-        gst_caps_unref(caps);
-        if (jpeg_factory == NULL)
-            return "jpegdec decoder plugin is unavailable";
-        gst_object_unref(jpeg_factory);
-        return NULL;
-    }
-
-    GstElementFactory *decodebin_factory = gst_element_factory_find("decodebin");
-    if (decodebin_factory == NULL) {
-        gst_caps_unref(caps);
-        return "decodebin plugin is unavailable";
-    }
-    gst_object_unref(decodebin_factory);
-    GList *decoders = gst_element_factory_list_get_elements(
-        GST_ELEMENT_FACTORY_TYPE_DECODER, GST_RANK_MARGINAL);
-    GList *compatible = decoders != NULL
-        ? gst_element_factory_list_filter(decoders, caps, GST_PAD_SINK, FALSE)
-        : NULL;
-    gst_caps_unref(caps);
-    gboolean has_compatible_decoder = compatible != NULL;
-    if (compatible != NULL)
-        gst_plugin_feature_list_free(compatible);
-    if (decoders != NULL)
-        gst_plugin_feature_list_free(decoders);
-    return has_compatible_decoder
-        ? NULL : "no installed decoder accepts the advertised caps";
 }
 
-static gboolean
-mode_is_usable(const CaptureVideoNode *node, const CaptureMode *mode)
+static const gchar *
+selected_decoder_description(const CaptureMode *mode)
 {
-    return mode_unusable_reason(node, mode) == NULL;
+    if (mode == NULL)
+        return "unavailable";
+    if (!mode->compressed)
+        return "none (raw capture)";
+    return is_mjpeg_mode(mode) ? "jpegdec" : "decodebin (dynamic selection)";
 }
 
 static void
-on_decode_pad_added(GstElement *decoder, GstPad *pad, gpointer user_data)
+pipeline_log_message(const gchar *message, gpointer user_data)
+{
+    app_log(user_data, "%s", message);
+}
+
+static void
+pipeline_state_changed(gpointer user_data)
 {
     AppState *app = user_data;
-    GstPad *sinkpad = gst_element_get_static_pad(app->video_convert, "sink");
-    if (sinkpad == NULL) {
-        app_log(app, "decodebin produced a pad but video converter has no sink pad");
-        return;
-    }
-    if (!gst_pad_is_linked(sinkpad)) {
-        GstCaps *caps = gst_pad_get_current_caps(pad);
-        gboolean raw_video = FALSE;
-        if (caps != NULL && !gst_caps_is_empty(caps)) {
-            const GstStructure *structure = gst_caps_get_structure(caps, 0);
-            raw_video = g_str_has_prefix(gst_structure_get_name(structure), "video/x-raw");
-        }
-        if (raw_video) {
-            GstPadLinkReturn linked = gst_pad_link(pad, sinkpad);
-            if (linked != GST_PAD_LINK_OK)
-                app_log(app, "Could not link decoded video pad: %s", gst_pad_link_get_name(linked));
-        }
-        if (caps != NULL)
-            gst_caps_unref(caps);
-    }
-    gst_object_unref(sinkpad);
-    (void)decoder;
+    app->retry_after_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    if (app->pipeline != NULL)
+        app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
+    g_clear_pointer(&app->audio_sink_name, g_free);
+    g_clear_pointer(&app->audio_sink_id, g_free);
+    app_refresh_ui(app);
 }
-
-static GstPadProbeReturn
-on_video_frame_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
-        AppState *app = user_data;
-        g_mutex_lock(&app->stats_mutex);
-        app->last_video_frame_us = g_get_monotonic_time();
-        g_mutex_unlock(&app->stats_mutex);
-    }
-    (void)pad;
-    return GST_PAD_PROBE_OK;
-}
-
-static gboolean
-setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
-{
-    GstElement *source = gst_element_factory_make("v4l2src", "capture-source");
-    GstElement *capsfilter = gst_element_factory_make("capsfilter", "capture-mode");
-    GstElement *queue = gst_element_factory_make("queue", "latest-frame-queue");
-    GstElement *convert = gst_element_factory_make("videoconvert", "video-convert");
-    GstElement *fps = gst_element_factory_make("fpsdisplaysink", "display-metrics");
-    GstElement *sink = capture_renderer_create_sink(app->renderer);
-    if (source == NULL || capsfilter == NULL || queue == NULL ||
-        convert == NULL || fps == NULL || sink == NULL) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_MISSING_PLUGIN,
-                    "Required video elements v4l2src/capsfilter/queue/videoconvert/fpsdisplaysink/appsink are unavailable");
-        if (source) gst_object_unref(source);
-        if (capsfilter) gst_object_unref(capsfilter);
-        if (queue) gst_object_unref(queue);
-        if (convert) gst_object_unref(convert);
-        if (fps) gst_object_unref(fps);
-        if (sink) gst_object_unref(sink);
-        return FALSE;
-    }
-
-    GstCaps *caps = caps_for_mode(mode);
-    if (caps == NULL) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_NEGOTIATION,
-                    "Unsupported V4L2 format %s for GStreamer", mode->format_name);
-        gst_object_unref(source);
-        gst_object_unref(capsfilter);
-        gst_object_unref(queue);
-        gst_object_unref(convert);
-        gst_object_unref(fps);
-        gst_object_unref(sink);
-        return FALSE;
-    }
-    g_object_set(source, "device", app->video_node->path, "io-mode", 2, NULL);
-    g_object_set(capsfilter, "caps", caps, NULL);
-    gst_caps_unref(caps);
-    g_object_set(queue,
-        "max-size-buffers", VIDEO_QUEUE_BUFFERS,
-        "max-size-bytes", 0,
-        "max-size-time", (guint64)0,
-        "leaky", 2,
-        NULL);
-    g_object_set(fps,
-        "video-sink", sink,
-        "text-overlay", FALSE,
-        "silent", TRUE,
-        "sync", FALSE,
-        "fps-update-interval", 1000,
-        "signal-fps-measurements", TRUE,
-        NULL);
-
-    GstElement *decoder = NULL;
-    if (is_mjpeg_mode(mode))
-        decoder = gst_element_factory_make("jpegdec", "mjpeg-decoder");
-    else if (mode->compressed)
-        decoder = gst_element_factory_make("decodebin", "video-decoder");
-
-    if ((is_mjpeg_mode(mode) || mode->compressed) && decoder == NULL) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_MISSING_PLUGIN,
-                    "No decoder is available for %s", mode->format_name);
-        gst_object_unref(source);
-        gst_object_unref(capsfilter);
-        gst_object_unref(queue);
-        gst_object_unref(convert);
-        gst_object_unref(fps);
-        gst_object_unref(sink);
-        return FALSE;
-    }
-
-    gst_bin_add_many(GST_BIN(app->pipeline), source, capsfilter, queue, convert, NULL);
-    if (decoder != NULL)
-        gst_bin_add(GST_BIN(app->pipeline), decoder);
-    gst_bin_add(GST_BIN(app->pipeline), fps);
-
-    app->video_queue = queue;
-    app->video_convert = convert;
-    app->fps_sink = fps;
-    app->video_sink = sink;
-
-    gboolean linked = FALSE;
-    if (decoder == NULL) {
-        linked = gst_element_link_many(source, capsfilter, queue, convert, fps, NULL);
-    } else if (is_mjpeg_mode(mode)) {
-        linked = gst_element_link_many(source, capsfilter, queue, decoder, convert,
-                                       fps, NULL);
-    } else {
-        linked = gst_element_link_many(source, capsfilter, queue, decoder, NULL) &&
-                 gst_element_link(convert, fps);
-        if (linked)
-            g_signal_connect(decoder, "pad-added", G_CALLBACK(on_decode_pad_added), app);
-    }
-    if (!linked) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_NEGOTIATION,
-                    "Could not link video elements for %s", mode->label);
-        return FALSE;
-    }
-    GstPad *frame_pad = gst_element_get_static_pad(convert, "src");
-    if (frame_pad != NULL) {
-        gst_pad_add_probe(frame_pad, GST_PAD_PROBE_TYPE_BUFFER,
-                          on_video_frame_buffer, app, NULL);
-        gst_object_unref(frame_pad);
-    }
-
-    g_signal_connect(fps, "fps-measurements", G_CALLBACK(on_fps_measurements), app);
-    return TRUE;
-}
-
-static gboolean
-setup_audio_branch(AppState *app, GError **error)
-{
-    if (!app->audio_enabled || app->audio_device == NULL)
-        return TRUE;
-
-    GstElement *source = gst_device_create_element(app->audio_device, "capture-audio-source");
-    GstElement *queue = gst_element_factory_make("queue", "audio-bounded-queue");
-    GstElement *convert = gst_element_factory_make("audioconvert", "audio-convert");
-    GstElement *resample = gst_element_factory_make("audioresample", "audio-resample");
-    GstElement *sink = gst_element_factory_make("pulsesink", "frame-speaker-sink");
-    if (source == NULL || queue == NULL || convert == NULL || resample == NULL || sink == NULL) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_MISSING_PLUGIN,
-                    "Required audio elements pulsesrc/queue/audioconvert/audioresample/pulsesink are unavailable");
-        if (source) gst_object_unref(source);
-        if (queue) gst_object_unref(queue);
-        if (convert) gst_object_unref(convert);
-        if (resample) gst_object_unref(resample);
-        if (sink) gst_object_unref(sink);
-        return FALSE;
-    }
-
-    g_object_set(source,
-        "buffer-time", (gint64)AUDIO_BUFFER_US,
-        "latency-time", (gint64)AUDIO_LATENCY_US,
-        "provide-clock", FALSE,
-        NULL);
-    g_object_set(queue,
-        "max-size-buffers", AUDIO_QUEUE_BUFFERS,
-        "max-size-bytes", 0,
-        "max-size-time", (guint64)AUDIO_QUEUE_NS,
-        "leaky", 0,
-        NULL);
-    g_object_set(sink,
-        "buffer-time", (gint64)AUDIO_BUFFER_US,
-        "latency-time", (gint64)AUDIO_LATENCY_US,
-        "sync", FALSE,
-        "volume", app->volume,
-        "client-name", "CaptureViewer",
-        NULL);
-    gst_bin_add_many(GST_BIN(app->pipeline), source, queue, convert, resample, sink, NULL);
-    if (!gst_element_link_many(source, queue, convert, resample, sink, NULL)) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_NEGOTIATION,
-                    "Could not link the selected audio input to the default speaker sink");
-        return FALSE;
-    }
-    app->audio_source = source;
-    app->audio_sink = sink;
-    app->audio_queue = queue;
-    return TRUE;
-}
-
 
 static void
 pipeline_stop(AppState *app)
 {
-    if (app->bus_watch_id != 0) {
-        g_source_remove(app->bus_watch_id);
-        app->bus_watch_id = 0;
-    }
     if (app->pipeline != NULL) {
-        GstState state = GST_STATE_VOID_PENDING;
-        gst_element_set_state(app->pipeline, GST_STATE_NULL);
-        GstStateChangeReturn state_result =
-            gst_element_get_state(app->pipeline, &state, NULL, GST_CLOCK_TIME_NONE);
-        if (app->renderer != NULL && state_result != GST_STATE_CHANGE_FAILURE &&
-            state == GST_STATE_NULL) {
-            capture_renderer_pipeline_stopped(app->renderer);
-        } else if (app->renderer != NULL) {
-            app_log(app, "Renderer teardown deferred: GStreamer pipeline did not reach NULL");
-        }
-        gst_object_unref(app->pipeline);
-    } else if (app->renderer != NULL) {
-        capture_renderer_pipeline_stopped(app->renderer);
+        capture_pipeline_stop(app->pipeline);
+        app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
     }
-    if (app->pipeline_bus != NULL)
-        gst_object_unref(app->pipeline_bus);
-    if (app->video_sink != NULL)
-        gst_object_unref(app->video_sink);
-    app->pipeline = NULL;
-    app->pipeline_bus = NULL;
-    app->video_queue = NULL;
-    app->video_convert = NULL;
-    app->fps_sink = NULL;
-    app->video_sink = NULL;
-    app->audio_source = NULL;
-    app->audio_sink = NULL;
-    app->audio_queue = NULL;
-    g_free(app->audio_sink_name);
-    g_free(app->audio_sink_id);
-    app->audio_sink_name = NULL;
-    app->audio_sink_id = NULL;
-    app->pipeline_started_us = 0;
-    g_mutex_lock(&app->stats_mutex);
-    app->current_fps = 0.0;
-    app->average_fps = 0.0;
-    app->frames_dropped = 0;
-    app->queue_level = 0;
-    app->last_video_frame_us = 0;
-    app->audio_source_latency_us = -1;
-    app->audio_source_buffer_us = -1;
-    app->latency_min_ns = -1;
-    app->latency_max_ns = -1;
-    g_mutex_unlock(&app->stats_mutex);
+    g_clear_pointer(&app->audio_sink_name, g_free);
+    g_clear_pointer(&app->audio_sink_id, g_free);
 }
 
+static gboolean
+pipeline_start(AppState *app)
+{
+    if (app->video_device == NULL || app->video_node == NULL ||
+        app->modes == NULL || app->current_mode >= app->modes->len ||
+        app->pipeline == NULL)
+        return FALSE;
+
+    CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
+    gboolean started = capture_pipeline_start(
+        app->pipeline, app->video_device, app->video_node, mode,
+        app->audio_device, app->audio_enabled, app->volume,
+        app->audio_device_id, app->audio_selection_status);
+    app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
+    if (started)
+        app_log_renderer_backend(app);
+    app_refresh_ui(app);
+    return started;
+}
 
 
 static gboolean
@@ -1143,8 +813,7 @@ refresh_audio_source(AppState *app)
     gchar *fresh_status = NULL;
     GstDevice *fresh_audio =
         resolve_selected_audio_device(app, &fresh_id, &fresh_status);
-    gboolean audio_changed =
-        g_strcmp0(fresh_id, app->audio_device_id) != 0;
+    gboolean audio_changed = g_strcmp0(fresh_id, app->audio_device_id) != 0;
     if (g_strcmp0(fresh_status, app->audio_selection_status) != 0) {
         g_free(app->audio_selection_status);
         app->audio_selection_status = g_strdup(fresh_status);
@@ -1152,7 +821,8 @@ refresh_audio_source(AppState *app)
                 fresh_status != NULL ? fresh_status : "status unavailable");
     }
     if (audio_changed) {
-        if (app->pipeline != NULL && app->audio_enabled)
+        if (app->pipeline != NULL &&
+            capture_pipeline_is_running(app->pipeline) && app->audio_enabled)
             pipeline_stop(app);
         if (app->audio_device != NULL)
             gst_object_unref(app->audio_device);
@@ -1179,295 +849,6 @@ refresh_audio_source(AppState *app)
     app_refresh_ui(app);
     return audio_changed;
 }
-static gchar *
-element_current_caps(GstElement *element, const gchar *pad_name)
-{
-    if (element == NULL)
-        return g_strdup("element unavailable");
-    GstPad *pad = gst_element_get_static_pad(element, pad_name);
-    if (pad == NULL)
-        return g_strdup("pad unavailable");
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    gst_object_unref(pad);
-    if (caps == NULL)
-        return g_strdup("not negotiated");
-    gchar *text = gst_caps_to_string(caps);
-    gst_caps_unref(caps);
-    return text;
-}
-
-static const gchar *
-video_buffer_type_name(enum v4l2_buf_type type)
-{
-    switch (type) {
-    case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-        return "VIDEO_CAPTURE";
-    case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
-        return "VIDEO_CAPTURE_MPLANE";
-    default:
-        return "unknown";
-    }
-}
-
-static const gchar *
-selected_decoder_description(const CaptureMode *mode)
-{
-    if (mode == NULL)
-        return "unavailable";
-    if (!mode->compressed)
-        return "none (raw capture)";
-    return is_mjpeg_mode(mode) ? "jpegdec" : "decodebin (dynamic selection)";
-}
-
-static gchar *
-capture_diagnostic_context(AppState *app)
-{
-    CaptureMode *mode = app->modes != NULL &&
-        app->current_mode < app->modes->len
-        ? g_ptr_array_index(app->modes, app->current_mode) : NULL;
-    CaptureVideoNode *node = app->video_node;
-    gchar *mode_key = mode != NULL ? capture_mode_key(mode)
-                                   : g_strdup("unavailable");
-    GstCaps *expected_caps = mode != NULL ? caps_for_mode(mode) : NULL;
-    gchar *expected_text = expected_caps != NULL
-        ? gst_caps_to_string(expected_caps) : g_strdup("unavailable");
-    if (expected_caps != NULL)
-        gst_caps_unref(expected_caps);
-    gchar *negotiated = element_current_caps(app->video_convert, "sink");
-    const gchar *renderer = app->renderer != NULL
-        ? capture_renderer_get_backend_name(app->renderer) : "unavailable";
-    gchar *context = g_strdup_printf(
-        "device-id=%s physical=%s usb-parent=%s serial=%s node=%s card=%s "
-        "driver=%s bus-info=%s capabilities=0x%08x buffer-type=%s "
-        "mode=%s [%s] decoder=%s renderer=%s expected-caps=%s "
-        "negotiated-videoconvert-sink=%s audio-source-id=%s audio-status=%s",
-        app->video_device != NULL && app->video_device->stable_id != NULL
-            ? app->video_device->stable_id : "unavailable",
-        app->video_device != NULL && app->video_device->physical_sysfs != NULL
-            ? app->video_device->physical_sysfs : "unavailable",
-        app->video_device != NULL && app->video_device->usb_sysfs != NULL
-            ? app->video_device->usb_sysfs : "non-USB",
-        app->video_device != NULL && app->video_device->serial != NULL
-            ? app->video_device->serial : "unavailable",
-        node != NULL && node->path != NULL ? node->path : "unavailable",
-        node != NULL && node->card_name != NULL ? node->card_name : "unavailable",
-        node != NULL && node->driver != NULL ? node->driver : "unavailable",
-        node != NULL && node->bus_info != NULL ? node->bus_info : "unavailable",
-        node != NULL ? node->capabilities : 0,
-        node != NULL ? video_buffer_type_name(node->buffer_type) : "unavailable",
-        mode != NULL ? mode->label : "unavailable", mode_key,
-        selected_decoder_description(mode), renderer, expected_text, negotiated,
-        app->audio_device_id != NULL ? app->audio_device_id : "unavailable",
-        app->audio_selection_status != NULL
-            ? app->audio_selection_status : "unavailable");
-    g_free(mode_key);
-    g_free(expected_text);
-    g_free(negotiated);
-    return context;
-}
-static gboolean
-pipeline_bus_message(GstBus *bus, GstMessage *message, gpointer user_data)
-{
-    AppState *app = user_data;
-    switch (GST_MESSAGE_TYPE(message)) {
-    case GST_MESSAGE_ERROR: {
-        GError *error = NULL;
-        gchar *debug = NULL;
-        gst_message_parse_error(message, &error, &debug);
-        gchar *context = capture_diagnostic_context(app);
-        const gchar *domain = error != NULL ? g_quark_to_string(error->domain) : NULL;
-        app_log(app,
-                "GStreamer ERROR domain=%s code=%d element=%s type=%s message=%s "
-                "debug=%s; %s",
-                domain != NULL ? domain : "unknown",
-                error != NULL ? error->code : -1,
-                GST_OBJECT_NAME(message->src),
-                G_OBJECT_TYPE_NAME(message->src),
-                error != NULL ? error->message : "unknown error",
-                debug != NULL ? debug : "unavailable", context);
-        g_free(app->pipeline_error);
-        app->pipeline_error = g_strdup_printf(
-            "%s (domain=%s, code=%d, element=%s)\n%s\nDebug: %s",
-            error != NULL ? error->message : "GStreamer pipeline error",
-            domain != NULL ? domain : "unknown",
-            error != NULL ? error->code : -1,
-            GST_OBJECT_NAME(message->src), context,
-            debug != NULL ? debug : "unavailable");
-        g_free(context);
-        if (error != NULL)
-            g_error_free(error);
-        g_free(debug);
-        app->retry_after_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
-        app->bus_watch_id = 0;
-        pipeline_stop(app);
-        app_refresh_ui(app);
-        return G_SOURCE_REMOVE;
-    }
-    case GST_MESSAGE_WARNING: {
-        GError *error = NULL;
-        gchar *debug = NULL;
-        gst_message_parse_warning(message, &error, &debug);
-        gchar *context = capture_diagnostic_context(app);
-        gchar *audio_detail = NULL;
-        if (app->audio_source != NULL &&
-            GST_MESSAGE_SRC(message) == GST_OBJECT(app->audio_source)) {
-            guint64 queue_time = 0;
-            guint queue_buffers = 0;
-            gint64 source_latency = -1;
-            gint64 source_buffer = -1;
-            if (app->audio_queue != NULL)
-                g_object_get(app->audio_queue,
-                             "current-level-time", &queue_time,
-                             "current-level-buffers", &queue_buffers, NULL);
-            if (app->audio_source != NULL &&
-                g_object_class_find_property(
-                    G_OBJECT_GET_CLASS(app->audio_source),
-                    "actual-latency-time") != NULL)
-                g_object_get(app->audio_source,
-                             "actual-latency-time", &source_latency,
-                             "actual-buffer-time", &source_buffer, NULL);
-            gchar *source_caps = element_current_caps(app->audio_source, "src");
-            gchar *sink_caps = element_current_caps(app->audio_sink, "sink");
-            audio_detail = g_strdup_printf(
-                "; audio-source-caps=%s audio-sink-caps=%s "
-                "audio-source-actual-latency=%" G_GINT64_FORMAT "us "
-                "audio-source-actual-buffer=%" G_GINT64_FORMAT "us "
-                "audio-queue=%u buffers/%" G_GUINT64_FORMAT "ns",
-                source_caps, sink_caps, source_latency, source_buffer,
-                queue_buffers, queue_time);
-            g_free(source_caps);
-            g_free(sink_caps);
-        }
-        app_log(app, "GStreamer WARNING element=%s message=%s debug=%s; %s%s",
-                GST_OBJECT_NAME(message->src),
-                error != NULL ? error->message : "unknown warning",
-                debug != NULL ? debug : "unavailable", context,
-                audio_detail != NULL ? audio_detail : "");
-        g_free(audio_detail);
-        g_free(context);
-        if (error != NULL)
-            g_error_free(error);
-        g_free(debug);
-        break;
-    }
-    case GST_MESSAGE_LATENCY:
-        gst_bin_recalculate_latency(GST_BIN(app->pipeline));
-        break;
-    case GST_MESSAGE_EOS:
-        app_log(app, "Unexpected end-of-stream from live capture pipeline");
-        app->retry_after_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
-        app->bus_watch_id = 0;
-        pipeline_stop(app);
-        app_refresh_ui(app);
-        return G_SOURCE_REMOVE;
-    default:
-        break;
-    }
-    (void)bus;
-    return G_SOURCE_CONTINUE;
-}
-
-static void
-on_fps_measurements(GstElement *element, gdouble fps, gdouble droprate,
-                    gdouble average, gpointer user_data)
-{
-    AppState *app = user_data;
-    g_mutex_lock(&app->stats_mutex);
-    app->current_fps = fps;
-    app->average_fps = average;
-    g_mutex_unlock(&app->stats_mutex);
-    (void)element;
-    (void)droprate;
-}
-static gboolean
-video_waiting_for_frames(AppState *app)
-{
-    if (app->pipeline == NULL || app->pipeline_started_us == 0)
-        return FALSE;
-    g_mutex_lock(&app->stats_mutex);
-    gint64 last_frame_us = app->last_video_frame_us;
-    g_mutex_unlock(&app->stats_mutex);
-    gint64 last_activity_us = last_frame_us > app->pipeline_started_us
-        ? last_frame_us : app->pipeline_started_us;
-    return g_get_monotonic_time() - last_activity_us >= 2 * G_USEC_PER_SEC;
-}
-
-
-static gboolean
-pipeline_start(AppState *app)
-{
-    if (app->video_device == NULL || app->modes == NULL ||
-        app->current_mode >= app->modes->len)
-        return FALSE;
-    CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
-    GError *error = NULL;
-    app->pipeline = gst_pipeline_new("captureviewer-pipeline");
-    if (app->pipeline == NULL) {
-        app->pipeline_error = g_strdup("Could not allocate GStreamer pipeline");
-        app_refresh_ui(app);
-        return FALSE;
-    }
-
-    if (!setup_video_branch(app, mode, &error) ||
-        !setup_audio_branch(app, &error)) {
-        gchar *context = capture_diagnostic_context(app);
-        const gchar *domain = error != NULL ? g_quark_to_string(error->domain) : NULL;
-        app_log(app, "Pipeline setup failed: %s; domain=%s code=%d; %s",
-                error != NULL ? error->message : "unknown error",
-                domain != NULL ? domain : "unknown",
-                error != NULL ? error->code : -1, context);
-        g_free(app->pipeline_error);
-        app->pipeline_error = g_strdup_printf(
-            "%s (domain=%s, code=%d)\n%s",
-            error != NULL ? error->message : "Pipeline setup failed",
-            domain != NULL ? domain : "unknown",
-            error != NULL ? error->code : -1, context);
-        g_free(context);
-        if (error != NULL)
-            g_error_free(error);
-        pipeline_stop(app);
-        app_refresh_ui(app);
-        return FALSE;
-    }
-
-    app->pipeline_bus = gst_element_get_bus(app->pipeline);
-    app->bus_watch_id = gst_bus_add_watch(app->pipeline_bus, pipeline_bus_message, app);
-    GstStateChangeReturn state = gst_element_set_state(app->pipeline, GST_STATE_PLAYING);
-    if (state == GST_STATE_CHANGE_FAILURE) {
-        GstState current = GST_STATE_VOID_PENDING;
-        GstState pending = GST_STATE_VOID_PENDING;
-        GstStateChangeReturn observed =
-            gst_element_get_state(app->pipeline, &current, &pending, 0);
-        gchar *context = capture_diagnostic_context(app);
-        app_log(app,
-                "GStreamer refused PLAYING for %s (state=%s pending=%s "
-                "query-result=%d); %s",
-                mode->label, gst_element_state_get_name(current),
-                gst_element_state_get_name(pending), observed, context);
-        g_free(app->pipeline_error);
-        app->pipeline_error = g_strdup_printf(
-            "GStreamer refused PLAYING (state=%s, pending=%s, query-result=%d)\n%s",
-            gst_element_state_get_name(current), gst_element_state_get_name(pending),
-            observed, context);
-        g_free(context);
-        app->retry_after_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
-        pipeline_stop(app);
-        app_refresh_ui(app);
-        return FALSE;
-    }
-    app->pipeline_started_us = g_get_monotonic_time();
-
-    app_log_renderer_backend(app);
-    g_free(app->pipeline_error);
-    app->pipeline_error = NULL;
-    app_log(app, "Started %s on %s; audio %s%s", mode->label,
-            app->video_node->path,
-            app->audio_enabled && app->audio_device != NULL ? "enabled" : "disabled",
-            app->audio_enabled && app->audio_device == NULL ? " (no audio source matched)" : "");
-    app_refresh_ui(app);
-    return TRUE;
-}
-
 static void
 app_restart_pipeline(AppState *app)
 {
@@ -1497,7 +878,7 @@ first_usable_video_node(CaptureDevice *device)
         gboolean usable = FALSE;
         for (guint mode_index = 0; modes != NULL && mode_index < modes->len;
              mode_index++) {
-            if (mode_is_usable(node, g_ptr_array_index(modes, mode_index))) {
+            if (capture_pipeline_mode_is_usable(node, g_ptr_array_index(modes, mode_index))) {
                 usable = TRUE;
                 break;
             }
@@ -1573,6 +954,8 @@ set_video_source(AppState *app, CaptureDevice *device, CaptureVideoNode *node)
     app->video_device = device;
     app->video_node = node;
     g_clear_pointer(&app->pipeline_error, g_free);
+    if (app->pipeline != NULL)
+        capture_pipeline_clear_error(app->pipeline);
     if (app->modes != NULL)
         g_ptr_array_unref(app->modes);
     app->modes = NULL;
@@ -1590,8 +973,9 @@ set_video_source(AppState *app, CaptureDevice *device, CaptureVideoNode *node)
         } else {
             for (guint i = 0; i < app->modes->len;) {
                 CaptureMode *item = g_ptr_array_index(app->modes, i);
-                if (!mode_is_usable(node, item)) {
-                    const gchar *reason = mode_unusable_reason(node, item);
+                if (!capture_pipeline_mode_is_usable(node, item)) {
+                    const gchar *reason =
+                        capture_pipeline_mode_unusable_reason(node, item);
                     gchar *key = capture_mode_key(item);
                     app_log(app, "Skipping unusable mode %s [%s] on %s: %s",
                             item->label, key, node->path, reason);
@@ -1714,7 +1098,8 @@ update_devices(gpointer user_data)
     refresh_audio_source(app);
 
     if (app->video_device != NULL && app->modes != NULL && app->modes->len > 0 &&
-        app->pipeline == NULL && g_get_monotonic_time() >= app->retry_after_us)
+        app->pipeline != NULL && !capture_pipeline_is_running(app->pipeline) &&
+        g_get_monotonic_time() >= app->retry_after_us)
         pipeline_start(app);
     return G_SOURCE_CONTINUE;
 }
@@ -1771,17 +1156,10 @@ stats_update(gpointer user_data)
     if (app->closing)
         return G_SOURCE_REMOVE;
 
-    if (app->pipeline != NULL) {
-        guint dropped = 0, queued = 0;
-        if (app->fps_sink != NULL)
-            g_object_get(app->fps_sink, "frames-dropped", &dropped, NULL);
-        if (app->video_queue != NULL)
-            g_object_get(app->video_queue, "current-level-buffers", &queued, NULL);
-        gint64 source_latency = -1, source_buffer = -1;
-        if (app->audio_source != NULL) {
-            g_object_get(app->audio_source, "actual-latency-time", &source_latency,
-                         "actual-buffer-time", &source_buffer, NULL);
-        }
+    if (app->pipeline != NULL &&
+        capture_pipeline_is_running(app->pipeline)) {
+        capture_pipeline_update_stats(app->pipeline);
+        app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
         gchar *sink_name = NULL;
         gchar *sink_id = NULL;
         find_default_audio_output(app, &sink_name, &sink_id);
@@ -1798,33 +1176,6 @@ stats_update(gpointer user_data)
         }
         g_free(sink_name);
         g_free(sink_id);
-        GstQuery *query = gst_query_new_latency();
-        gint64 min_latency = -1, max_latency = -1;
-        gboolean live = FALSE;
-        if (gst_element_query(app->pipeline, query)) {
-            GstClockTime min = GST_CLOCK_TIME_NONE, max = GST_CLOCK_TIME_NONE;
-            gst_query_parse_latency(query, &live, &min, &max);
-            min_latency = GST_CLOCK_TIME_IS_VALID(min) ? (gint64)min : -1;
-            max_latency = GST_CLOCK_TIME_IS_VALID(max) ? (gint64)max : -1;
-        }
-        gst_query_unref(query);
-
-        gint64 cpu_time = process_cpu_time_us();
-        gint64 wall_time = g_get_monotonic_time();
-        if (app->last_cpu_time_us > 0 && wall_time > app->last_cpu_time_us) {
-            app->cpu_percent = (gdouble)(cpu_time - app->last_cpu_us) * 100.0 /
-                               (wall_time - app->last_cpu_time_us);
-        }
-        app->last_cpu_us = cpu_time;
-        app->last_cpu_time_us = wall_time;
-        g_mutex_lock(&app->stats_mutex);
-        app->frames_dropped = dropped;
-        app->queue_level = queued;
-        app->audio_source_latency_us = source_latency;
-        app->audio_source_buffer_us = source_buffer;
-        app->latency_min_ns = min_latency;
-        app->latency_max_ns = max_latency;
-        g_mutex_unlock(&app->stats_mutex);
     }
     app_log_renderer_backend(app);
     app_refresh_ui(app);
@@ -1836,7 +1187,15 @@ app_refresh_ui(AppState *app)
 {
     if (app->window == NULL)
         return;
-    gboolean waiting_for_frames = video_waiting_for_frames(app);
+    gboolean pipeline_running = app->pipeline != NULL &&
+        capture_pipeline_is_running(app->pipeline);
+    CapturePipelineStats stats = app->pipeline_stats;
+    const gchar *pipeline_error = app->pipeline != NULL
+        ? capture_pipeline_get_error(app->pipeline) : NULL;
+    if (pipeline_error == NULL)
+        pipeline_error = app->pipeline_error;
+    gboolean waiting_for_frames = pipeline_running &&
+        capture_pipeline_is_waiting_for_frames(app->pipeline);
     gboolean show_diagnostics =
         app->settings != NULL && gtk_widget_get_visible(app->settings);
     CaptureMode *mode = app->modes != NULL &&
@@ -1894,12 +1253,10 @@ app_refresh_ui(AppState *app)
     gchar *mode_text;
     if (mode != NULL) {
         gchar *mode_key = capture_mode_key(mode);
-        GstCaps *expected_caps = caps_for_mode(mode);
-        gchar *expected_text = expected_caps != NULL
-            ? gst_caps_to_string(expected_caps) : g_strdup("unavailable");
-        if (expected_caps != NULL)
-            gst_caps_unref(expected_caps);
-        gchar *negotiated_text = element_current_caps(app->video_convert, "sink");
+        gchar *expected_text = capture_pipeline_mode_caps_description(mode);
+        gchar *negotiated_text = app->pipeline != NULL
+            ? capture_pipeline_dup_video_input_caps(app->pipeline)
+            : g_strdup("element unavailable");
         mode_text = g_strdup_printf(
             "Mode: %s\nExact mode ID: %s\nExpected capture caps: %s\n"
             "Negotiated videoconvert input caps: %s",
@@ -1943,47 +1300,46 @@ app_refresh_ui(AppState *app)
     gchar *perf = NULL;
     gchar *latency_text = NULL;
     gchar *audio_stats = NULL;
-    g_mutex_lock(&app->stats_mutex);
     if (show_diagnostics) {
-        latency_text = app->latency_min_ns >= 0
-            ? (app->latency_max_ns >= 0
+        latency_text = stats.latency_min_ns >= 0
+            ? (stats.latency_max_ns >= 0
                 ? g_strdup_printf("Pipeline-reported latency %.1f–%.1f ms (not end-to-end)",
-                    app->latency_min_ns / 1000000.0,
-                    app->latency_max_ns / 1000000.0)
+                    stats.latency_min_ns / 1000000.0,
+                    stats.latency_max_ns / 1000000.0)
                 : g_strdup_printf("Pipeline-reported latency ≥ %.1f ms (not end-to-end)",
-                    app->latency_min_ns / 1000000.0))
+                    stats.latency_min_ns / 1000000.0))
             : g_strdup("Pipeline-reported latency unavailable (not end-to-end)");
         perf = g_strdup_printf("FPS %.1f avg %.1f · dropped %" G_GUINT64_FORMAT
             " · queue %" G_GUINT64_FORMAT " · CPU %.1f%% · %s",
-            app->current_fps, app->average_fps, app->frames_dropped,
-            app->queue_level, app->cpu_percent, latency_text);
+            stats.current_fps, stats.average_fps, stats.frames_dropped,
+            stats.queue_level, stats.cpu_percent, latency_text);
         audio_stats =
-            app->audio_device != NULL && app->audio_enabled && app->audio_source != NULL
-            ? (app->audio_source_latency_us >= 0 &&
-               app->audio_source_buffer_us >= 0
+            app->audio_device != NULL && app->audio_enabled &&
+            app->pipeline != NULL && capture_pipeline_has_audio_source(app->pipeline)
+            ? (stats.audio_source_latency_us >= 0 &&
+               stats.audio_source_buffer_us >= 0
                 ? g_strdup_printf("Source timing: %.1f ms latency / %.1f ms buffer",
-                    app->audio_source_latency_us / 1000.0,
-                    app->audio_source_buffer_us / 1000.0)
+                    stats.audio_source_latency_us / 1000.0,
+                    stats.audio_source_buffer_us / 1000.0)
                 : g_strdup("Source timing: unavailable"))
             : g_strdup("Source timing: unavailable");
     }
     if (app->stats_overlay_label != NULL) {
-        gchar *overlay_latency = app->latency_min_ns >= 0
-            ? (app->latency_max_ns >= 0
+        gchar *overlay_latency = stats.latency_min_ns >= 0
+            ? (stats.latency_max_ns >= 0
                 ? g_strdup_printf("Pipeline-reported latency %.0f–%.0f ms (not end-to-end)",
-                    app->latency_min_ns / 1000000.0,
-                    app->latency_max_ns / 1000000.0)
+                    stats.latency_min_ns / 1000000.0,
+                    stats.latency_max_ns / 1000000.0)
                 : g_strdup_printf("Pipeline-reported latency ≥ %.0f ms (not end-to-end)",
-                    app->latency_min_ns / 1000000.0))
+                    stats.latency_min_ns / 1000000.0))
             : g_strdup("Pipeline-reported latency unavailable");
         overlay_text = g_strdup_printf(
             "%s\nFPS %.1f avg %.1f · dropped %" G_GUINT64_FORMAT
             " · CPU %.1f%% · %s",
-            mode_name, app->current_fps, app->average_fps,
-            app->frames_dropped, app->cpu_percent, overlay_latency);
+            mode_name, stats.current_fps, stats.average_fps,
+            stats.frames_dropped, stats.cpu_percent, overlay_latency);
         g_free(overlay_latency);
     }
-    g_mutex_unlock(&app->stats_mutex);
     if (show_diagnostics) {
         if (app->perf_label != NULL)
             gtk_label_set_text(GTK_LABEL(app->perf_label), perf);
@@ -2009,7 +1365,8 @@ app_refresh_ui(AppState *app)
         else if (app->audio_device == NULL)
             route_text = g_strdup(app->audio_selection_status != NULL
                 ? app->audio_selection_status : "No selected audio input is available");
-        else if (app->audio_source == NULL)
+        else if (app->pipeline == NULL ||
+                 !capture_pipeline_has_audio_source(app->pipeline))
             route_text = g_strdup(
                 "Input detected; playback inactive because capture pipeline is stopped");
         else if (sink_display != NULL)
@@ -2026,11 +1383,11 @@ app_refresh_ui(AppState *app)
             gtk_label_set_text(GTK_LABEL(app->audio_route_label), audio_route);
 
         const gchar *status_base;
-        if (app->pipeline != NULL && waiting_for_frames)
+        if (pipeline_running && waiting_for_frames)
             status_base = "Pipeline active; waiting for video frames (signal status unavailable)";
-        else if (app->pipeline != NULL)
+        else if (pipeline_running)
             status_base = "Capture pipeline active";
-        else if (app->pipeline_error != NULL)
+        else if (pipeline_error != NULL)
             status_base = "Capture pipeline stopped after an error";
         else if (app->video_device == NULL && app->selected_video_device_id != NULL)
             status_base = "Saved video source is unavailable";
@@ -2049,8 +1406,8 @@ app_refresh_ui(AppState *app)
             gtk_label_set_text(GTK_LABEL(app->status_label), status_text);
         if (app->pipeline_error_label != NULL)
             gtk_label_set_text(GTK_LABEL(app->pipeline_error_label),
-                app->pipeline_error != NULL
-                    ? app->pipeline_error : "No pipeline error recorded");
+                pipeline_error != NULL
+                    ? pipeline_error : "No pipeline error recorded");
         if (app->log_path_label != NULL)
             gtk_label_set_text(GTK_LABEL(app->log_path_label),
                 app->log_path != NULL ? app->log_path : "Log path unavailable");
@@ -2072,13 +1429,13 @@ app_refresh_ui(AppState *app)
             message = "Saved source unavailable\nReconnect it or choose another source.";
         else if (app->video_device == NULL)
             message = "Waiting for a USB video capture source";
-        else if (app->pipeline_error != NULL)
+        else if (pipeline_error != NULL)
             message = "Capture error\nOpen Advanced for the error, debug trace, device, and caps.";
         else if (app->modes == NULL || app->modes->len == 0)
             message = "No usable capture mode\nOpen Advanced for decoder and caps details.";
         else if (waiting_for_frames)
             message = "Waiting for video frames\nCapture signal status is unavailable.";
-        else if (app->pipeline == NULL)
+        else if (!pipeline_running)
             message = "Capture device connected\nWaiting for capture to start.";
         gboolean show_status = message != NULL;
         if (show_status &&
@@ -2308,8 +1665,8 @@ volume_changed(GtkRange *range, gpointer user_data)
 {
     AppState *app = user_data;
     app->volume = gtk_range_get_value(range);
-    if (app->audio_sink != NULL)
-        g_object_set(app->audio_sink, "volume", app->volume, NULL);
+    if (app->pipeline != NULL)
+        capture_pipeline_set_volume(app->pipeline, app->volume);
     app_schedule_preference_save(app);
 }
 
@@ -3160,6 +2517,13 @@ app_activate(GtkApplication *application, gpointer user_data)
     }
     capture_renderer_set_scale_mode(app->renderer, app->scale_mode);
     capture_renderer_connect_motion_events(app->renderer, window_motion, app);
+    CapturePipelineCallbacks pipeline_callbacks = {
+        .log_message = pipeline_log_message,
+        .state_changed = pipeline_state_changed,
+    };
+    app->pipeline =
+        capture_pipeline_new(app->renderer, &pipeline_callbacks, app);
+    app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
     app->root_overlay = gtk_overlay_new();
     app->video_area = gtk_event_box_new();
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->video_area), FALSE);
@@ -3225,7 +2589,10 @@ app_shutdown(GApplication *application, gpointer user_data)
         g_source_remove(app->stats_watch_id);
     if (app->device_watch_id != 0)
         g_source_remove(app->device_watch_id);
-    pipeline_stop(app);
+    if (app->pipeline != NULL) {
+        capture_pipeline_free(app->pipeline);
+        app->pipeline = NULL;
+    }
     if (app->renderer != NULL) {
         capture_renderer_free(app->renderer);
         app->renderer = NULL;
@@ -3256,7 +2623,6 @@ app_shutdown(GApplication *application, gpointer user_data)
     g_free(app->renderer_backend_logged);
     app_log(app, "Viewer shut down cleanly");
     g_free(app->log_path);
-    g_mutex_clear(&app->stats_mutex);
     g_mutex_clear(&app->log_mutex);
     (void)application;
 }
@@ -3304,8 +2670,8 @@ list_modes(void)
             for (guint mode_index = 0; mode_index < modes->len; mode_index++) {
                 CaptureMode *mode = g_ptr_array_index(modes, mode_index);
                 gchar *key = capture_mode_key(mode);
-                const gchar *reason = mode_is_usable(node, mode)
-                    ? NULL : mode_unusable_reason(node, mode);
+                const gchar *reason =
+                    capture_pipeline_mode_unusable_reason(node, mode);
                 if (reason == NULL) {
                     g_print("    %03u  %s  [%s] — usable\n",
                             mode_index, mode->label, key);
@@ -3331,17 +2697,12 @@ main(int argc, char **argv)
         return list_modes();
     AppState app = {0};
     app.mode_preferences = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-    g_mutex_init(&app.stats_mutex);
     g_mutex_init(&app.log_mutex);
     app.audio_enabled = TRUE;
     app.audio_selection_id = g_strdup("auto");
     app.volume = 0.8;
     app.panel_dwell_ms = 150;
     app.panel_hide_delay_ms = 700;
-    app.audio_source_latency_us = -1;
-    app.audio_source_buffer_us = -1;
-    app.latency_min_ns = -1;
-    app.latency_max_ns = -1;
     app.config_path = g_build_filename(g_get_user_config_dir(), "captureviewer",
                                        "config.ini", NULL);
     app.log_path = g_build_filename(g_get_user_data_dir(), "captureviewer",

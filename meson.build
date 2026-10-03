@@ -30,7 +30,7 @@ math = cc.find_library('m', required: true)
 
 viewer = executable(
   'captureviewer',
-  ['src/main.c', 'src/capture.c', 'src/renderer.c'],
+  ['src/main.c', 'src/capture.c', 'src/renderer.c', 'src/pipeline.c'],
   dependencies: [gtk, glib, gst, gst_video, gst_audio, gst_app, epoxy, math],
   c_args: cc_args,
   install: true,
