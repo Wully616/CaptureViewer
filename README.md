@@ -65,7 +65,7 @@ Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/
 
 ## Architecture
 
-`src/main.c` coordinates the GTK application, UI, and audio-device matching. `src/capture.c` owns V4L2/sysfs discovery, `src/renderer.c` owns the video surface, `src/pipeline.c` owns GStreamer capture/playback lifecycle, and `src/preferences.c` owns configuration defaults, migration, and persistence. Pipeline and preferences internals are hidden behind module APIs; preference values are exposed to the application as a borrowed view.
+`src/main.c` coordinates the GTK application and connects the UI, capture, audio, renderer, preferences, and pipeline modules. `src/audio.c` owns GStreamer audio-device discovery, USB physical-identity matching, selected-source state, and default-output tracking. `src/capture.c` owns V4L2/sysfs discovery, `src/renderer.c` owns the video surface, `src/pipeline.c` owns GStreamer capture/playback lifecycle, and `src/preferences.c` owns configuration defaults, migration, and persistence. Internal state for audio, pipeline, and preferences is hidden behind module APIs; preference and audio values are exposed as borrowed views.
 
 ## Build dependencies
 

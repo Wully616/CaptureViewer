@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "capture.h"
+#include "audio.h"
 #include "pipeline.h"
 #include "preferences.h"
 #include "renderer.h"
@@ -57,19 +58,12 @@ struct AppState {
     CapturePreferencesValues *prefs;
     CaptureDevice *video_device;
     CaptureVideoNode *video_node;
-    GstDeviceMonitor *device_monitor;
-    GstDevice *audio_device;
-    gchar *audio_device_id;
-    gchar *audio_display_name;
-    gchar *audio_sink_name;
-    gchar *audio_sink_id;
-    gchar *audio_selection_status;
+    CaptureAudio *audio;
     gchar *log_path;
     gchar *renderer_backend_logged;
     gchar *pipeline_error;
     CapturePipeline *pipeline;
     CapturePipelineStats pipeline_stats;
-    guint device_watch_id;
     guint monitor_watch_id;
     guint stats_watch_id;
     guint dwell_watch_id;
@@ -180,283 +174,26 @@ app_log_renderer_backend(AppState *app)
     app_log(app, "Selected video renderer: %s", backend);
 }
 
-static gboolean
-get_usb_id(const GstStructure *properties, const gchar *name, guint64 *value)
-{
-    const GValue *v = gst_structure_get_value(properties, name);
-    if (v == NULL)
-        return FALSE;
-    if (G_VALUE_HOLDS_STRING(v)) {
-        const gchar *text = g_value_get_string(v);
-        if (text == NULL)
-            return FALSE;
-        gchar *end = NULL;
-        guint64 parsed = g_ascii_strtoull(text, &end, 0);
-        if (end == text || *end != '\0')
-            return FALSE;
-        *value = parsed;
-        return TRUE;
-    }
-    if (G_VALUE_HOLDS_UINT(v)) {
-        *value = g_value_get_uint(v);
-        return TRUE;
-    }
-    if (G_VALUE_HOLDS_INT(v)) {
-        gint parsed = g_value_get_int(v);
-        if (parsed < 0)
-            return FALSE;
-        *value = (guint64)parsed;
-        return TRUE;
-    }
-    if (G_VALUE_HOLDS_UINT64(v)) {
-        *value = g_value_get_uint64(v);
-        return TRUE;
-    }
-    if (G_VALUE_HOLDS_INT64(v)) {
-        gint64 parsed = g_value_get_int64(v);
-        if (parsed < 0)
-            return FALSE;
-        *value = (guint64)parsed;
-        return TRUE;
-    }
-    return FALSE;
-}
+typedef struct {
+    AppState *app;
+    GHashTable *seen;
+    gboolean selected_present;
+} AudioSelectorContext;
 
-static gchar *
-normalize_sysfs_path(const gchar *path)
+static void
+append_audio_source(const gchar *identity,
+                    const gchar *display_name,
+                    gpointer user_data)
 {
-    if (path == NULL || *path == '\0')
-        return NULL;
-    gchar *absolute = g_str_has_prefix(path, "/devices/")
-        ? g_build_filename("/sys", path + 1, NULL) : g_strdup(path);
-    gchar *normalized = g_canonicalize_filename(absolute, NULL);
-    g_free(absolute);
-    return normalized;
-}
-
-static gchar *
-usb_parent_from_sysfs(const gchar *sysfs_path)
-{
-    gchar *path = normalize_sysfs_path(sysfs_path);
-    while (path != NULL) {
-        gchar *vendor = g_build_filename(path, "idVendor", NULL);
-        gchar *product = g_build_filename(path, "idProduct", NULL);
-        gboolean is_usb_parent =
-            g_file_test(vendor, G_FILE_TEST_EXISTS) &&
-            g_file_test(product, G_FILE_TEST_EXISTS);
-        g_free(vendor);
-        g_free(product);
-        if (is_usb_parent)
-            return path;
-        gchar *parent = g_path_get_dirname(path);
-        if (g_str_equal(parent, path)) {
-            g_free(parent);
-            g_free(path);
-            return NULL;
-        }
-        g_free(path);
-        path = parent;
+    AudioSelectorContext *context = user_data;
+    AppState *app = context->app;
+    if (!g_hash_table_contains(context->seen, identity)) {
+        g_hash_table_add(context->seen, g_strdup(identity));
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
+                                  identity, display_name);
     }
-    return NULL;
-}
-
-static gchar *
-usb_interface_from_sysfs(const gchar *sysfs_path, const gchar *usb_parent)
-{
-    gchar *path = normalize_sysfs_path(sysfs_path);
-    if (path == NULL || usb_parent == NULL ||
-        !g_str_has_prefix(path, usb_parent) ||
-        path[strlen(usb_parent)] != '/') {
-        g_free(path);
-        return NULL;
-    }
-    const gchar *relative = path + strlen(usb_parent) + 1;
-    const gchar *separator = strchr(relative, '/');
-    gsize length = separator != NULL ? (gsize)(separator - relative)
-                                     : strlen(relative);
-    gchar *interface = g_strndup(relative, length);
-    g_free(path);
-    if (strchr(interface, ':') == NULL) {
-        g_free(interface);
-        return NULL;
-    }
-    return interface;
-}
-
-static gchar *
-audio_device_identity(GstDevice *device, gboolean *persistent)
-{
-    if (persistent != NULL)
-        *persistent = FALSE;
-    GstStructure *properties = gst_device_get_properties(device);
-    if (properties == NULL) {
-        gchar *name = gst_device_get_display_name(device);
-        gchar *identity = g_strdup_printf("session:%s", name);
-        g_free(name);
-        return identity;
-    }
-    guint64 vendor = 0, product = 0;
-    gboolean have_usb_ids =
-        get_usb_id(properties, "device.vendor.id", &vendor) &&
-        get_usb_id(properties, "device.product.id", &product);
-    const gchar *serial = gst_structure_get_string(properties, "device.serial");
-    const gchar *sysfs = gst_structure_get_string(properties, "sysfs.path");
-    gchar *usb_parent = usb_parent_from_sysfs(sysfs);
-    gchar *usb_interface = usb_parent != NULL
-        ? usb_interface_from_sysfs(sysfs, usb_parent) : NULL;
-    gchar *normalized_sysfs = usb_parent == NULL
-        ? normalize_sysfs_path(sysfs) : NULL;
-    gchar *identity = NULL;
-    if (usb_parent != NULL && have_usb_ids) {
-        identity = serial != NULL
-            ? g_strdup_printf("usb:%04" G_GINT64_MODIFIER "x:%04"
-                G_GINT64_MODIFIER "x:serial:%s:sysfs:%s%s%s",
-                vendor, product, serial, usb_parent,
-                usb_interface != NULL ? ":interface:" : "",
-                usb_interface != NULL ? usb_interface : "")
-            : g_strdup_printf("usb:%04" G_GINT64_MODIFIER "x:%04"
-                G_GINT64_MODIFIER "x:sysfs:%s%s%s", vendor, product, usb_parent,
-                usb_interface != NULL ? ":interface:" : "",
-                usb_interface != NULL ? usb_interface : "");
-        if (persistent != NULL)
-            *persistent = TRUE;
-    } else if (serial != NULL && have_usb_ids) {
-        identity = g_strdup_printf("usb:%04" G_GINT64_MODIFIER "x:%04"
-            G_GINT64_MODIFIER "x:serial:%s", vendor, product, serial);
-        if (persistent != NULL)
-            *persistent = TRUE;
-    } else if (normalized_sysfs != NULL) {
-        identity = g_strdup_printf("sysfs:%s", normalized_sysfs);
-        if (persistent != NULL)
-            *persistent = TRUE;
-    } else {
-        const gchar *node_name =
-            gst_structure_get_string(properties, "node.name");
-        gchar *display_name = node_name != NULL
-            ? g_strdup(node_name) : gst_device_get_display_name(device);
-        identity = g_strdup_printf("session:%s", display_name);
-        g_free(display_name);
-    }
-    g_free(usb_parent);
-    g_free(normalized_sysfs);
-    g_free(usb_interface);
-    gst_structure_free(properties);
-    return identity;
-}
-
-static gboolean
-is_audio_source_device(GstDevice *device)
-{
-    gchar *klass = gst_device_get_device_class(device);
-    gboolean source = g_strcmp0(klass, "Audio/Source") == 0;
-    g_free(klass);
-    if (!source)
-        return FALSE;
-    GstStructure *properties = gst_device_get_properties(device);
-    if (properties == NULL)
-        return TRUE;
-    const gchar *device_class = gst_structure_get_string(properties, "device.class");
-    gboolean is_virtual = FALSE;
-    gst_structure_get_boolean(properties, "node.virtual", &is_virtual);
-    gboolean physical_source =
-        g_strcmp0(device_class, "monitor") != 0 && !is_virtual;
-    gst_structure_free(properties);
-    return physical_source;
-}
-
-static gboolean
-audio_device_matches_video(GstDevice *audio, const CaptureDevice *video)
-{
-    if (video == NULL || video->usb_sysfs == NULL)
-        return FALSE;
-    GstStructure *properties = gst_device_get_properties(audio);
-    if (properties == NULL)
-        return FALSE;
-    guint64 vendor = 0, product = 0;
-    gboolean have_usb_ids =
-        get_usb_id(properties, "device.vendor.id", &vendor) &&
-        get_usb_id(properties, "device.product.id", &product);
-    if (have_usb_ids &&
-        (vendor != video->usb_vid || product != video->usb_pid)) {
-        gst_structure_free(properties);
-        return FALSE;
-    }
-    const gchar *serial = gst_structure_get_string(properties, "device.serial");
-    const gchar *sysfs = gst_structure_get_string(properties, "sysfs.path");
-    gchar *audio_usb_parent = usb_parent_from_sysfs(sysfs);
-    gboolean matches;
-    if (audio_usb_parent != NULL) {
-        matches = g_strcmp0(audio_usb_parent, video->usb_sysfs) == 0;
-    } else {
-        matches = have_usb_ids && video->serial != NULL && serial != NULL &&
-            g_str_equal(video->serial, serial);
-    }
-    g_free(audio_usb_parent);
-    gst_structure_free(properties);
-    return matches;
-}
-
-static GstDevice *
-resolve_selected_audio_device(AppState *app, gchar **identity, gchar **status)
-{
-    *identity = NULL;
-    *status = NULL;
-    const gchar *selection = app->prefs->audio_selection_id != NULL
-        ? app->prefs->audio_selection_id : "auto";
-    if (g_str_equal(selection, "none")) {
-        *status = g_strdup("No audio input selected");
-        return NULL;
-    }
-    if (g_str_equal(selection, "auto") &&
-        (app->video_device == NULL || app->video_device->usb_sysfs == NULL)) {
-        *status = g_strdup("Auto matching waits for a selected USB capture device");
-        return NULL;
-    }
-    if (app->device_monitor == NULL) {
-        *status = g_strdup("Audio device monitor is unavailable");
-        return NULL;
-    }
-
-    GList *devices = gst_device_monitor_get_devices(app->device_monitor);
-    GstDevice *found = NULL;
-    guint matches = 0;
-    for (GList *item = devices; item != NULL; item = item->next) {
-        GstDevice *candidate = GST_DEVICE(item->data);
-        if (!is_audio_source_device(candidate))
-            continue;
-        gboolean match;
-        gchar *candidate_identity = audio_device_identity(candidate, NULL);
-        if (g_str_equal(selection, "auto"))
-            match = audio_device_matches_video(candidate, app->video_device);
-        else
-            match = g_str_equal(selection, candidate_identity);
-        g_free(candidate_identity);
-        if (match) {
-            matches++;
-            if (found == NULL)
-                found = g_object_ref(candidate);
-        }
-    }
-    g_list_free_full(devices, g_object_unref);
-    if (matches == 1) {
-        *identity = audio_device_identity(found, NULL);
-        *status = g_strdup(g_str_equal(selection, "auto")
-            ? "Auto-matched a unique audio input by USB physical identity"
-            : "Selected the requested audio input by stable identity");
-        return found;
-    }
-    if (found != NULL)
-        gst_object_unref(found);
-    if (matches > 1)
-        *status = g_strdup_printf(
-            "%u audio inputs match this identity; routing is disabled as ambiguous",
-            matches);
-    else if (g_str_equal(selection, "auto"))
-        *status = g_strdup(
-            "No audio input uniquely matches the selected capture device");
-    else
-        *status = g_strdup_printf("Selected audio input is unavailable: %s", selection);
-    return NULL;
+    if (g_strcmp0(identity, app->prefs->audio_selection_id) == 0)
+        context->selected_present = TRUE;
 }
 
 static void
@@ -470,84 +207,25 @@ populate_audio_selector(AppState *app)
                               "auto", "Auto — match selected capture device");
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
                               "none", "None");
-    gboolean selected_present =
-        g_strcmp0(app->prefs->audio_selection_id, "auto") == 0 ||
-        g_strcmp0(app->prefs->audio_selection_id, "none") == 0;
-    GHashTable *seen =
-        g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    GList *devices = app->device_monitor != NULL
-        ? gst_device_monitor_get_devices(app->device_monitor) : NULL;
-    for (GList *item = devices; item != NULL; item = item->next) {
-        GstDevice *device = GST_DEVICE(item->data);
-        if (!is_audio_source_device(device))
-            continue;
-        gchar *identity = audio_device_identity(device, NULL);
-        if (!g_hash_table_contains(seen, identity)) {
-            g_hash_table_add(seen, g_strdup(identity));
-            gchar *name = gst_device_get_display_name(device);
-            gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
-                                      identity, name);
-            g_free(name);
-        }
-        if (g_strcmp0(identity, app->prefs->audio_selection_id) == 0)
-            selected_present = TRUE;
-        g_free(identity);
-    }
-    g_list_free_full(devices, g_object_unref);
-    if (!selected_present && app->prefs->audio_selection_id != NULL)
+    AudioSelectorContext context = {
+        .app = app,
+        .seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL),
+        .selected_present =
+            g_strcmp0(app->prefs->audio_selection_id, "auto") == 0 ||
+            g_strcmp0(app->prefs->audio_selection_id, "none") == 0
+    };
+    capture_audio_foreach_source(app->audio, append_audio_source, &context);
+    if (!context.selected_present && app->prefs->audio_selection_id != NULL)
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->audio_combo),
                                   app->prefs->audio_selection_id,
                                   "Selected audio input unavailable");
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->audio_combo),
                                 app->prefs->audio_selection_id != NULL
                                     ? app->prefs->audio_selection_id : "auto");
-    g_hash_table_unref(seen);
+    g_hash_table_unref(context.seen);
     app->updating_controls = FALSE;
 }
 
-static gboolean
-find_default_audio_output(AppState *app, gchar **display_name, gchar **device_id)
-{
-    *display_name = NULL;
-    *device_id = NULL;
-    if (app->device_monitor == NULL)
-        return FALSE;
-
-    GList *devices = gst_device_monitor_get_devices(app->device_monitor);
-    gboolean found = FALSE;
-    for (GList *item = devices; item != NULL; item = item->next) {
-        GstDevice *device = GST_DEVICE(item->data);
-        gchar *device_class = gst_device_get_device_class(device);
-        gboolean audio_sink = g_strcmp0(device_class, "Audio/Sink") == 0;
-        g_free(device_class);
-        if (!audio_sink)
-            continue;
-        GstStructure *properties = gst_device_get_properties(device);
-        gboolean is_default = FALSE;
-        const gchar *id = NULL;
-        const gchar *description = NULL;
-        if (properties != NULL) {
-            gst_structure_get_boolean(properties, "is-default", &is_default);
-            id = gst_structure_get_string(properties, "node.name");
-            if (id == NULL)
-                id = gst_structure_get_string(properties, "device.string");
-            description = gst_structure_get_string(properties, "device.description");
-        }
-        if (is_default) {
-            *display_name = description != NULL ? g_strdup(description)
-                                                : gst_device_get_display_name(device);
-            *device_id = g_strdup(id);
-            found = TRUE;
-            if (properties != NULL)
-                gst_structure_free(properties);
-            break;
-        }
-        if (properties != NULL)
-            gst_structure_free(properties);
-    }
-    g_list_free_full(devices, g_object_unref);
-    return found;
-}
 
 static void
 save_preferred_mode(AppState *app)
@@ -663,8 +341,7 @@ pipeline_state_changed(gpointer user_data)
     app->retry_after_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
     if (app->pipeline != NULL)
         app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
-    g_clear_pointer(&app->audio_sink_name, g_free);
-    g_clear_pointer(&app->audio_sink_id, g_free);
+    capture_audio_clear_default_output(app->audio);
     app_refresh_ui(app);
 }
 
@@ -675,8 +352,7 @@ pipeline_stop(AppState *app)
         capture_pipeline_stop(app->pipeline);
         app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
     }
-    g_clear_pointer(&app->audio_sink_name, g_free);
-    g_clear_pointer(&app->audio_sink_id, g_free);
+    capture_audio_clear_default_output(app->audio);
 }
 
 static gboolean
@@ -688,10 +364,11 @@ pipeline_start(AppState *app)
         return FALSE;
 
     CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
+    CaptureAudioState audio_state = capture_audio_get_state(app->audio);
     gboolean started = capture_pipeline_start(
         app->pipeline, app->video_device, app->video_node, mode,
-        app->audio_device, app->prefs->audio_enabled, app->prefs->volume,
-        app->audio_device_id, app->audio_selection_status);
+        audio_state.source, app->prefs->audio_enabled, app->prefs->volume,
+        audio_state.source_id, audio_state.source_status);
     app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
     if (started)
         app_log_renderer_backend(app);
@@ -703,46 +380,29 @@ pipeline_start(AppState *app)
 static gboolean
 refresh_audio_source(AppState *app)
 {
-    gchar *fresh_id = NULL;
-    gchar *fresh_status = NULL;
-    GstDevice *fresh_audio =
-        resolve_selected_audio_device(app, &fresh_id, &fresh_status);
-    gboolean audio_changed = g_strcmp0(fresh_id, app->audio_device_id) != 0;
-    if (g_strcmp0(fresh_status, app->audio_selection_status) != 0) {
-        g_free(app->audio_selection_status);
-        app->audio_selection_status = g_strdup(fresh_status);
+    CaptureAudioUpdate update = capture_audio_update_source(
+        app->audio, app->video_device, app->prefs->audio_selection_id);
+    CaptureAudioState audio_state = capture_audio_get_state(app->audio);
+    if (update.status_changed)
         app_log(app, "Audio input selection: %s",
-                fresh_status != NULL ? fresh_status : "status unavailable");
-    }
-    if (audio_changed) {
+                audio_state.source_status != NULL
+                    ? audio_state.source_status : "status unavailable");
+    if (update.source_changed) {
         if (app->pipeline != NULL &&
             capture_pipeline_is_running(app->pipeline) && app->prefs->audio_enabled)
             pipeline_stop(app);
-        if (app->audio_device != NULL)
-            gst_object_unref(app->audio_device);
-        app->audio_device = fresh_audio;
-        fresh_audio = NULL;
-        g_free(app->audio_device_id);
-        app->audio_device_id = fresh_id;
-        fresh_id = NULL;
-        g_free(app->audio_display_name);
-        app->audio_display_name = app->audio_device != NULL
-            ? gst_device_get_display_name(app->audio_device) : NULL;
-        if (app->audio_device != NULL)
+        if (audio_state.source != NULL)
             app_log(app, "Selected audio input: %s [%s]",
-                    app->audio_display_name != NULL
-                        ? app->audio_display_name : "unnamed",
-                    app->audio_device_id);
+                    audio_state.source_display_name != NULL
+                        ? audio_state.source_display_name : "unnamed",
+                    audio_state.source_id);
         else
             app_log(app, "No audio input is currently routed");
     }
-    if (fresh_audio != NULL)
-        gst_object_unref(fresh_audio);
-    g_free(fresh_id);
-    g_free(fresh_status);
     app_refresh_ui(app);
-    return audio_changed;
+    return update.source_changed;
 }
+
 static void
 app_restart_pipeline(AppState *app)
 {
@@ -1007,41 +667,18 @@ rescan_devices_idle(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
-static gboolean
-device_monitor_message(GstBus *bus, GstMessage *message, gpointer user_data)
+static void
+audio_device_event(const CaptureAudioDeviceEvent *event, gpointer user_data)
 {
     AppState *app = user_data;
-    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_DEVICE_ADDED ||
-        GST_MESSAGE_TYPE(message) == GST_MESSAGE_DEVICE_REMOVED) {
-        GstDevice *device = NULL;
-        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_DEVICE_ADDED)
-            gst_message_parse_device_added(message, &device);
-        else
-            gst_message_parse_device_removed(message, &device);
-        if (device != NULL) {
-            gchar *display_name = gst_device_get_display_name(device);
-            gchar *device_class = gst_device_get_device_class(device);
-            gchar *identity = audio_device_identity(device, NULL);
-            GstStructure *properties = gst_device_get_properties(device);
-            gchar *property_text = properties != NULL
-                ? gst_structure_to_string(properties) : g_strdup("unavailable");
-            app_log(app, "GStreamer device %s: name=%s class=%s identity=%s properties=%s",
-                    GST_MESSAGE_TYPE(message) == GST_MESSAGE_DEVICE_ADDED ? "added" : "removed",
-                    display_name, device_class != NULL ? device_class : "unknown",
-                    identity, property_text);
-            if (properties != NULL)
-                gst_structure_free(properties);
-            g_free(display_name);
-            g_free(device_class);
-            g_free(identity);
-            g_free(property_text);
-            gst_object_unref(device);
-        }
-        populate_audio_selector(app);
-        g_idle_add(rescan_devices_idle, app);
-    }
-    (void)bus;
-    return G_SOURCE_CONTINUE;
+    if (event != NULL)
+        app_log(app, "GStreamer device %s: name=%s class=%s identity=%s properties=%s",
+                event->added ? "added" : "removed",
+                event->display_name,
+                event->device_class != NULL ? event->device_class : "unknown",
+                event->identity, event->properties);
+    populate_audio_selector(app);
+    g_idle_add(rescan_devices_idle, app);
 }
 
 static gboolean
@@ -1055,22 +692,16 @@ stats_update(gpointer user_data)
         capture_pipeline_is_running(app->pipeline)) {
         capture_pipeline_update_stats(app->pipeline);
         app->pipeline_stats = capture_pipeline_get_stats(app->pipeline);
-        gchar *sink_name = NULL;
-        gchar *sink_id = NULL;
-        find_default_audio_output(app, &sink_name, &sink_id);
-        if (g_strcmp0(app->audio_sink_name, sink_name) != 0 ||
-            g_strcmp0(app->audio_sink_id, sink_id) != 0) {
-            g_free(app->audio_sink_name);
-            g_free(app->audio_sink_id);
-            app->audio_sink_name = g_strdup(sink_name);
-            app->audio_sink_id = g_strdup(sink_id);
-            if (sink_name != NULL || sink_id != NULL)
+        if (capture_audio_refresh_default_output(app->audio)) {
+            CaptureAudioState audio_state = capture_audio_get_state(app->audio);
+            if (audio_state.default_output_name != NULL ||
+                audio_state.default_output_id != NULL)
                 app_log(app, "PulseAudio default playback output: name=%s id=%s",
-                        sink_name != NULL ? sink_name : "(unavailable)",
-                        sink_id != NULL ? sink_id : "(unavailable)");
+                        audio_state.default_output_name != NULL
+                            ? audio_state.default_output_name : "(unavailable)",
+                        audio_state.default_output_id != NULL
+                            ? audio_state.default_output_id : "(unavailable)");
         }
-        g_free(sink_name);
-        g_free(sink_id);
     }
     app_log_renderer_backend(app);
     app_refresh_ui(app);
@@ -1082,6 +713,7 @@ app_refresh_ui(AppState *app)
 {
     if (app->window == NULL)
         return;
+    CaptureAudioState audio_state = capture_audio_get_state(app->audio);
     gboolean pipeline_running = app->pipeline != NULL &&
         capture_pipeline_is_running(app->pipeline);
     CapturePipelineStats stats = app->pipeline_stats;
@@ -1189,7 +821,7 @@ app_refresh_ui(AppState *app)
     }
     if (app->volume_scale != NULL)
         gtk_widget_set_sensitive(app->volume_scale,
-                                 app->prefs->audio_enabled && app->audio_device != NULL);
+                                 app->prefs->audio_enabled && audio_state.source != NULL);
 
     gchar *overlay_text = NULL;
     gchar *perf = NULL;
@@ -1209,7 +841,7 @@ app_refresh_ui(AppState *app)
             stats.current_fps, stats.average_fps, stats.frames_dropped,
             stats.queue_level, stats.cpu_percent, latency_text);
         audio_stats =
-            app->audio_device != NULL && app->prefs->audio_enabled &&
+            audio_state.source != NULL && app->prefs->audio_enabled &&
             app->pipeline != NULL && capture_pipeline_has_audio_source(app->pipeline)
             ? (stats.audio_source_latency_us >= 0 &&
                stats.audio_source_buffer_us >= 0
@@ -1240,26 +872,30 @@ app_refresh_ui(AppState *app)
             gtk_label_set_text(GTK_LABEL(app->perf_label), perf);
 
         gchar *sink_display =
-            app->audio_sink_name != NULL && *app->audio_sink_name != '\0'
-            ? (app->audio_sink_id != NULL && *app->audio_sink_id != '\0'
-                ? g_strdup_printf("%s (%s)", app->audio_sink_name, app->audio_sink_id)
-                : g_strdup(app->audio_sink_name))
-            : (app->audio_sink_id != NULL && *app->audio_sink_id != '\0'
-                ? g_strdup(app->audio_sink_id) : NULL);
+            audio_state.default_output_name != NULL &&
+                *audio_state.default_output_name != '\0'
+            ? (audio_state.default_output_id != NULL &&
+                    *audio_state.default_output_id != '\0'
+                ? g_strdup_printf("%s (%s)", audio_state.default_output_name,
+                                  audio_state.default_output_id)
+                : g_strdup(audio_state.default_output_name))
+            : (audio_state.default_output_id != NULL &&
+                    *audio_state.default_output_id != '\0'
+                ? g_strdup(audio_state.default_output_id) : NULL);
         const gchar *policy =
             app->prefs->audio_selection_id == NULL ||
             g_str_equal(app->prefs->audio_selection_id, "auto") ? "Auto" :
             g_str_equal(app->prefs->audio_selection_id, "none") ? "None" : "Explicit source";
-        const gchar *input_name = app->audio_display_name != NULL
-            ? app->audio_display_name : "No audio input";
-        const gchar *input_identity = app->audio_device_id != NULL
-            ? app->audio_device_id : "unavailable";
+        const gchar *input_name = audio_state.source_display_name != NULL
+            ? audio_state.source_display_name : "No audio input";
+        const gchar *input_identity = audio_state.source_id != NULL
+            ? audio_state.source_id : "unavailable";
         gchar *route_text;
         if (!app->prefs->audio_enabled)
             route_text = g_strdup("Audio is disabled");
-        else if (app->audio_device == NULL)
-            route_text = g_strdup(app->audio_selection_status != NULL
-                ? app->audio_selection_status : "No selected audio input is available");
+        else if (audio_state.source == NULL)
+            route_text = g_strdup(audio_state.source_status != NULL
+                ? audio_state.source_status : "No selected audio input is available");
         else if (app->pipeline == NULL ||
                  !capture_pipeline_has_audio_source(app->pipeline))
             route_text = g_strdup(
@@ -1271,8 +907,8 @@ app_refresh_ui(AppState *app)
         gchar *audio_route = g_strdup_printf(
             "Policy: %s\nInput: %s\nInput identity: %s\nStatus: %s\n%s\n%s",
             policy, input_name, input_identity,
-            app->audio_selection_status != NULL ? app->audio_selection_status
-                                                : "No audio status available",
+            audio_state.source_status != NULL ? audio_state.source_status
+                                               : "No audio status available",
             route_text, audio_stats);
         if (app->audio_route_label != NULL)
             gtk_label_set_text(GTK_LABEL(app->audio_route_label), audio_route);
@@ -2452,19 +2088,9 @@ app_activate(GtkApplication *application, gpointer user_data)
     app_log_session_context(app);
     app_log_renderer_backend(app);
     app->fullscreen = TRUE;
-    app->device_monitor = gst_device_monitor_new();
-    GstCaps *audio_caps = gst_caps_new_empty_simple("audio/x-raw");
-    gst_device_monitor_add_filter(app->device_monitor, "Audio/Source", audio_caps);
-    gst_device_monitor_add_filter(app->device_monitor, "Audio/Sink", audio_caps);
-    gst_caps_unref(audio_caps);
-    if (gst_device_monitor_start(app->device_monitor)) {
-        GstBus *bus = gst_device_monitor_get_bus(app->device_monitor);
-        app->device_watch_id = gst_bus_add_watch(bus, device_monitor_message, app);
-        g_source_set_name_by_id(app->device_watch_id, "captureviewer-device-monitor");
-        gst_object_unref(bus);
-    } else {
+    app->audio = capture_audio_new(audio_device_event, app);
+    if (!capture_audio_start(app->audio))
         app_log(app, "GStreamer device monitor could not start; periodic sysfs scan remains active");
-    }
     populate_audio_selector(app);
 
     populate_video_devices(app);
@@ -2490,8 +2116,7 @@ app_shutdown(GApplication *application, gpointer user_data)
         g_source_remove(app->monitor_watch_id);
     if (app->stats_watch_id != 0)
         g_source_remove(app->stats_watch_id);
-    if (app->device_watch_id != 0)
-        g_source_remove(app->device_watch_id);
+    capture_audio_stop(app->audio);
     if (app->pipeline != NULL) {
         capture_pipeline_free(app->pipeline);
         app->pipeline = NULL;
@@ -2500,21 +2125,13 @@ app_shutdown(GApplication *application, gpointer user_data)
         capture_renderer_free(app->renderer);
         app->renderer = NULL;
     }
-    if (app->device_monitor != NULL) {
-        gst_device_monitor_stop(app->device_monitor);
-        gst_object_unref(app->device_monitor);
-    }
-    if (app->audio_device != NULL)
-        gst_object_unref(app->audio_device);
+    capture_audio_free(app->audio);
+    app->audio = NULL;
     if (app->modes != NULL)
         g_ptr_array_unref(app->modes);
     if (app->video_devices != NULL)
         g_ptr_array_unref(app->video_devices);
-    g_free(app->audio_device_id);
-    g_free(app->audio_selection_status);
-    g_free(app->audio_display_name);
-    g_free(app->audio_sink_name);
-    g_free(app->audio_sink_id);
+
     capture_preferences_free(app->preferences);
     g_free(app->pipeline_error);
     g_free(app->renderer_backend_logged);
