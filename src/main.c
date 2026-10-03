@@ -80,6 +80,7 @@ struct AppState {
     GstElement *pipeline;
     GstBus *pipeline_bus;
     GstElement *video_queue;
+    GstElement *audio_queue;
     GstElement *video_convert;
     GstElement *fps_sink;
     GstElement *video_sink;
@@ -1063,7 +1064,7 @@ setup_audio_branch(AppState *app, GError **error)
     g_object_set(sink,
         "buffer-time", (gint64)AUDIO_BUFFER_US,
         "latency-time", (gint64)AUDIO_LATENCY_US,
-        "sync", TRUE,
+        "sync", FALSE,
         "volume", app->volume,
         "client-name", "CaptureViewer",
         NULL);
@@ -1075,6 +1076,7 @@ setup_audio_branch(AppState *app, GError **error)
     }
     app->audio_source = source;
     app->audio_sink = sink;
+    app->audio_queue = queue;
     return TRUE;
 }
 
@@ -1113,6 +1115,7 @@ pipeline_stop(AppState *app)
     app->video_sink = NULL;
     app->audio_source = NULL;
     app->audio_sink = NULL;
+    app->audio_queue = NULL;
     g_free(app->audio_sink_name);
     g_free(app->audio_sink_id);
     app->audio_sink_name = NULL;
@@ -1305,10 +1308,42 @@ pipeline_bus_message(GstBus *bus, GstMessage *message, gpointer user_data)
         gchar *debug = NULL;
         gst_message_parse_warning(message, &error, &debug);
         gchar *context = capture_diagnostic_context(app);
-        app_log(app, "GStreamer WARNING element=%s message=%s debug=%s; %s",
+        gchar *audio_detail = NULL;
+        if (app->audio_source != NULL &&
+            GST_MESSAGE_SRC(message) == GST_OBJECT(app->audio_source)) {
+            guint64 queue_time = 0;
+            guint queue_buffers = 0;
+            gint64 source_latency = -1;
+            gint64 source_buffer = -1;
+            if (app->audio_queue != NULL)
+                g_object_get(app->audio_queue,
+                             "current-level-time", &queue_time,
+                             "current-level-buffers", &queue_buffers, NULL);
+            if (app->audio_source != NULL &&
+                g_object_class_find_property(
+                    G_OBJECT_GET_CLASS(app->audio_source),
+                    "actual-latency-time") != NULL)
+                g_object_get(app->audio_source,
+                             "actual-latency-time", &source_latency,
+                             "actual-buffer-time", &source_buffer, NULL);
+            gchar *source_caps = element_current_caps(app->audio_source, "src");
+            gchar *sink_caps = element_current_caps(app->audio_sink, "sink");
+            audio_detail = g_strdup_printf(
+                "; audio-source-caps=%s audio-sink-caps=%s "
+                "audio-source-actual-latency=%" G_GINT64_FORMAT "us "
+                "audio-source-actual-buffer=%" G_GINT64_FORMAT "us "
+                "audio-queue=%u buffers/%" G_GUINT64_FORMAT "ns",
+                source_caps, sink_caps, source_latency, source_buffer,
+                queue_buffers, queue_time);
+            g_free(source_caps);
+            g_free(sink_caps);
+        }
+        app_log(app, "GStreamer WARNING element=%s message=%s debug=%s; %s%s",
                 GST_OBJECT_NAME(message->src),
                 error != NULL ? error->message : "unknown warning",
-                debug != NULL ? debug : "unavailable", context);
+                debug != NULL ? debug : "unavailable", context,
+                audio_detail != NULL ? audio_detail : "");
+        g_free(audio_detail);
         g_free(context);
         if (error != NULL)
             g_error_free(error);
