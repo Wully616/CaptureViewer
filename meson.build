@@ -37,6 +37,7 @@ viewer = executable(
     'src/pipeline.c',
     'src/preferences.c',
     'src/audio.c',
+    'src/ui.c',
   ],
   dependencies: [gtk, glib, gst, gst_video, gst_audio, gst_app, epoxy, math],
   c_args: cc_args,
