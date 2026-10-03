@@ -23,11 +23,11 @@ In the SteamOS test environment, a headset reboot previously cleared a session-o
 
 ### Platform limitations
 
-The current video pipeline requires X11 `ximagesink`; Wayland-only environments may not work. Device access, audio routing, and sink availability depend on the host. Flatpak permissions alone do not prove that real hardware capture or audio routing works in the sandbox. Steam Frame is the primary development/test platform; there is no claim of SteamOS/Discover certification or a published distribution.
+The GTK renderer uses OpenGL when available and falls back to Cairo; it no longer depends on GStreamer `ximagesink`. SteamVR launch, OpenGL initialization, Switch video/audio, and FIT/FILL have been verified in a Gamescope/Xwayland session. Wayland-only playback is not yet validated, and the Flatpak manifest currently exposes X11 only. Device access and audio routing depend on the host. Flatpak permissions alone do not prove real hardware capture or audio routing in the sandbox. Steam Frame is the primary development/test platform; there is no claim of SteamOS/Discover certification or a published distribution.
 
 ## Controls and behavior
 
-The application starts fullscreen. Use **S** to show or hide the auto-hiding control panel, **F11** to toggle fullscreen, and **Q** or the panel's **Quit** button to exit. **Escape** closes an open settings dialog or submenu first; otherwise it exits fullscreen or hides the panel. Escape never quits the application. The panel provides dynamic capture-mode selection, HDMI audio enable/volume, fullscreen, settings, stats, and pin controls. Settings includes diagnostics and panel timing controls. Statistics label GStreamer latency as pipeline-reported, not end-to-end.
+The application starts fullscreen. Use **S** to show or hide the auto-hiding control panel, **F11** to toggle fullscreen, and **Q** or the panel's **Quit** button to exit. **Escape** closes an open settings dialog or submenu first; otherwise it exits fullscreen or hides the panel. Escape never quits the application. The panel provides dynamic capture-mode selection, HDMI audio enable/volume, fullscreen, settings, stats, and pin controls. Settings includes diagnostics, panel timing controls, and video scaling (**Fit** or **Fill**). Statistics label GStreamer latency as pipeline-reported, not end-to-end.
 
 HDMI audio is captured separately from video and routed through GStreamer's PulseAudio-compatible `pulsesink` to the host's default output. The intended Steam Frame route is its speakers. The quick-panel toggle and HDMI volume slider affect captured HDMI audio only; actual availability and routing depend on the host audio service and sandbox permissions.
 
@@ -46,11 +46,14 @@ Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/
 A C11 compiler, Meson (0.60 or newer), Ninja, and pkg-config are needed, along with development packages discoverable via pkg-config for:
 
 - GTK 3 (`gtk+-3.0`)
+- GLib 2.74 or newer (`glib-2.0`)
 - GStreamer core (`gstreamer-1.0`)
 - GStreamer video (`gstreamer-video-1.0`)
 - GStreamer audio (`gstreamer-audio-1.0`)
+- GStreamer app (`gstreamer-app-1.0`)
+- libepoxy (`epoxy`)
 
-At runtime, install the applicable GStreamer plugins/elements for V4L2 capture, MJPEG decoding/conversion, `fpsdisplaysink`, `ximagesink`, and the chosen audio source/sink. Exact plugin packages vary by distribution. No dependencies are vendored; the source implementation contains no intentionally copied third-party code. The listed libraries and runtime plugins are external dependencies.
+At runtime, install the applicable GStreamer plugins/elements for V4L2 capture, MJPEG decoding/conversion, `fpsdisplaysink`, and the chosen audio source/sink. GTK renders through OpenGL or its Cairo fallback; `ximagesink` is not required. Exact plugin packages vary by distribution. No dependencies are vendored; the source implementation contains no intentionally copied third-party code. The listed libraries and runtime plugins are external dependencies.
 
 ### Build and run
 

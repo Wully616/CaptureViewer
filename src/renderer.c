@@ -1,0 +1,728 @@
+#include "renderer.h"
+
+#include <epoxy/gl.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+#include <math.h>
+
+struct _CaptureRenderer {
+    gint ref_count;
+    GtkWidget *stack;
+    GtkWidget *gl_area;
+    GtkWidget *cairo_area;
+    gulong gl_motion_handler_id;
+    gulong cairo_motion_handler_id;
+    GMainContext *main_context;
+    GMutex sample_mutex;
+    GstSample *latest_sample;
+    GstElement *sink;
+    gchar *backend_name;
+    guint64 sample_generation;
+    guint64 uploaded_generation;
+    guint source_width;
+    guint source_height;
+    guint pixel_aspect_num;
+    guint pixel_aspect_den;
+    GLuint texture;
+    GLuint program;
+    GLuint vertex_array;
+    GLuint vertex_buffer;
+    GLint position_location;
+    GLint texcoord_location;
+    GLint sampler_location;
+    guint texture_width;
+    guint texture_height;
+    CaptureRendererScaleMode scale_mode;
+    gboolean dispatch_pending;
+    gboolean closing;
+    gboolean gl_initialized;
+};
+
+static CaptureRenderer *capture_renderer_ref(CaptureRenderer *renderer);
+static void capture_renderer_unref(CaptureRenderer *renderer);
+
+static GLuint
+compile_shader(GLenum type, const gchar *source, GError **error)
+{
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled == GL_TRUE)
+        return shader;
+
+    GLint log_length = 0;
+    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &log_length);
+    gchar *log = g_malloc0((gsize)MAX(log_length, 1));
+    glGetShaderInfoLog(shader, log_length, NULL, log);
+    g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                "Could not compile renderer shader: %s", log);
+    g_free(log);
+    glDeleteShader(shader);
+    return 0;
+}
+
+static gboolean
+create_gl_resources(CaptureRenderer *renderer, GError **error)
+{
+    static const gchar *vertex_source =
+        "#version 150\n"
+        "in vec2 position;\n"
+        "in vec2 texcoord;\n"
+        "out vec2 frame_texcoord;\n"
+        "void main() {\n"
+        "    frame_texcoord = texcoord;\n"
+        "    gl_Position = vec4(position, 0.0, 1.0);\n"
+        "}\n";
+    static const gchar *fragment_source =
+        "#version 150\n"
+        "uniform sampler2D frame_texture;\n"
+        "in vec2 frame_texcoord;\n"
+        "out vec4 color;\n"
+        "void main() { color = texture(frame_texture, frame_texcoord); }\n";
+
+    GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source, error);
+    if (vertex == 0)
+        return FALSE;
+    GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source, error);
+    if (fragment == 0) {
+        glDeleteShader(vertex);
+        return FALSE;
+    }
+
+    renderer->program = glCreateProgram();
+    glAttachShader(renderer->program, vertex);
+    glAttachShader(renderer->program, fragment);
+    glBindAttribLocation(renderer->program, 0, "position");
+    glBindAttribLocation(renderer->program, 1, "texcoord");
+    glLinkProgram(renderer->program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(renderer->program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        GLint log_length = 0;
+        glGetProgramiv(renderer->program, GL_INFO_LOG_LENGTH, &log_length);
+        gchar *log = g_malloc0((gsize)MAX(log_length, 1));
+        glGetProgramInfoLog(renderer->program, log_length, NULL, log);
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not link renderer shader program: %s", log);
+        g_free(log);
+        glDeleteProgram(renderer->program);
+        renderer->program = 0;
+        return FALSE;
+    }
+
+    renderer->position_location = glGetAttribLocation(renderer->program, "position");
+    renderer->texcoord_location = glGetAttribLocation(renderer->program, "texcoord");
+    renderer->sampler_location = glGetUniformLocation(renderer->program, "frame_texture");
+    glGenVertexArrays(1, &renderer->vertex_array);
+    glGenBuffers(1, &renderer->vertex_buffer);
+    glGenTextures(1, &renderer->texture);
+    glBindTexture(GL_TEXTURE_2D, renderer->texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    renderer->gl_initialized = TRUE;
+    return TRUE;
+}
+
+static void
+set_backend_name(CaptureRenderer *renderer, const gchar *name)
+{
+    g_free(renderer->backend_name);
+    renderer->backend_name = g_strdup(name);
+}
+
+static void
+use_cairo_fallback(CaptureRenderer *renderer, const gchar *reason)
+{
+    g_warning("CaptureRenderer: GtkGLArea unavailable (%s); using Cairo", reason);
+    set_backend_name(renderer, "GtkDrawingArea/Cairo");
+    gtk_stack_set_visible_child(GTK_STACK(renderer->stack), renderer->cairo_area);
+    gtk_widget_queue_draw(renderer->cairo_area);
+}
+
+static void
+on_gl_realize(GtkGLArea *area, gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    gtk_gl_area_make_current(area);
+    GError *error = gtk_gl_area_get_error(area);
+    if (error != NULL) {
+        use_cairo_fallback(renderer, error->message);
+        return;
+    }
+
+    if (!create_gl_resources(renderer, &error)) {
+        use_cairo_fallback(renderer, error != NULL ? error->message : "GL initialization failed");
+        g_clear_error(&error);
+        return;
+    }
+
+    const gchar *vendor = (const gchar *)glGetString(GL_VENDOR);
+    const gchar *name = (const gchar *)glGetString(GL_RENDERER);
+    const gchar *version = (const gchar *)glGetString(GL_VERSION);
+    gchar *backend = g_strdup_printf("GtkGLArea/OpenGL (vendor=%s, renderer=%s, version=%s)",
+                                     vendor != NULL ? vendor : "unknown",
+                                     name != NULL ? name : "unknown",
+                                     version != NULL ? version : "unknown");
+    set_backend_name(renderer, backend);
+    g_free(backend);
+    g_message("CaptureRenderer GL context: vendor=%s renderer=%s version=%s",
+              vendor != NULL ? vendor : "unknown",
+              name != NULL ? name : "unknown",
+              version != NULL ? version : "unknown");
+}
+
+static void
+on_gl_unrealize(GtkGLArea *area, gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    if (!renderer->gl_initialized)
+        return;
+
+    gtk_gl_area_make_current(area);
+    if (gtk_gl_area_get_error(area) == NULL) {
+        glDeleteTextures(1, &renderer->texture);
+        glDeleteBuffers(1, &renderer->vertex_buffer);
+        glDeleteVertexArrays(1, &renderer->vertex_array);
+        glDeleteProgram(renderer->program);
+    }
+    renderer->texture = 0;
+    renderer->vertex_buffer = 0;
+    renderer->vertex_array = 0;
+    renderer->program = 0;
+    renderer->texture_width = 0;
+    renderer->texture_height = 0;
+    renderer->gl_initialized = FALSE;
+}
+
+gboolean
+capture_renderer_compute_layout(guint source_width,
+                                guint source_height,
+                                guint pixel_aspect_num,
+                                guint pixel_aspect_den,
+                                guint area_width,
+                                guint area_height,
+                                CaptureRendererScaleMode mode,
+                                CaptureRendererLayout *layout)
+{
+    if (layout == NULL)
+        return FALSE;
+    *layout = (CaptureRendererLayout){0};
+    if (source_width == 0 || source_height == 0 ||
+        pixel_aspect_num == 0 || pixel_aspect_den == 0 ||
+        area_width == 0 || area_height == 0 ||
+        area_width > G_MAXINT || area_height > G_MAXINT ||
+        (mode != CAPTURE_RENDERER_FIT && mode != CAPTURE_RENDERER_FILL))
+        return FALSE;
+
+    long double source_aspect =
+        ((long double)source_width * pixel_aspect_num) /
+        ((long double)source_height * pixel_aspect_den);
+    long double area_aspect = (long double)area_width / area_height;
+    if (!isfinite((double)source_aspect) || source_aspect <= 0.0L ||
+        !isfinite((double)area_aspect) || area_aspect <= 0.0L)
+        return FALSE;
+
+    if (mode == CAPTURE_RENDERER_FIT) {
+        guint viewport_width;
+        guint viewport_height;
+        if (source_aspect > area_aspect) {
+            viewport_width = area_width;
+            viewport_height = (guint)floorl((long double)area_width / source_aspect + 0.5L);
+            viewport_height = CLAMP(viewport_height, 1, area_height);
+        } else {
+            viewport_height = area_height;
+            viewport_width = (guint)floorl((long double)area_height * source_aspect + 0.5L);
+            viewport_width = CLAMP(viewport_width, 1, area_width);
+        }
+        layout->viewport.x = (gint)((area_width - viewport_width) / 2);
+        layout->viewport.y = (gint)((area_height - viewport_height) / 2);
+        layout->viewport.width = (gint)viewport_width;
+        layout->viewport.height = (gint)viewport_height;
+        layout->u1 = 1.0;
+        layout->v1 = 1.0;
+        return TRUE;
+    }
+
+    layout->viewport = (GdkRectangle){0, 0, (gint)area_width, (gint)area_height};
+    layout->u1 = 1.0;
+    layout->v1 = 1.0;
+    if (source_aspect > area_aspect) {
+        gdouble visible_fraction = (gdouble)(area_aspect / source_aspect);
+        layout->u0 = (1.0 - visible_fraction) / 2.0;
+        layout->u1 = 1.0 - layout->u0;
+    } else if (source_aspect < area_aspect) {
+        gdouble visible_fraction = (gdouble)(source_aspect / area_aspect);
+        layout->v0 = (1.0 - visible_fraction) / 2.0;
+        layout->v1 = 1.0 - layout->v0;
+    }
+    return TRUE;
+}
+
+static GstSample *
+get_latest_sample(CaptureRenderer *renderer, guint64 *generation)
+{
+    g_mutex_lock(&renderer->sample_mutex);
+    GstSample *sample = renderer->latest_sample != NULL
+        ? gst_sample_ref(renderer->latest_sample) : NULL;
+    *generation = renderer->sample_generation;
+    g_mutex_unlock(&renderer->sample_mutex);
+    return sample;
+}
+
+static gboolean
+map_rgba_sample(GstSample *sample, GstVideoInfo *info, GstVideoFrame *frame)
+{
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    if (caps == NULL || buffer == NULL || !gst_video_info_from_caps(info, caps) ||
+        GST_VIDEO_INFO_FORMAT(info) != GST_VIDEO_FORMAT_RGBA)
+        return FALSE;
+    return gst_video_frame_map(frame, info, buffer, GST_MAP_READ);
+}
+
+static gboolean
+layout_for_area(CaptureRenderer *renderer, GtkWidget *area,
+                guint width, guint height, CaptureRendererLayout *layout)
+{
+    g_mutex_lock(&renderer->sample_mutex);
+    guint source_width = renderer->source_width;
+    guint source_height = renderer->source_height;
+    guint par_num = renderer->pixel_aspect_num;
+    guint par_den = renderer->pixel_aspect_den;
+    CaptureRendererScaleMode mode = renderer->scale_mode;
+    g_mutex_unlock(&renderer->sample_mutex);
+    (void)area;
+    return capture_renderer_compute_layout(source_width, source_height,
+                                           par_num, par_den, width, height,
+                                           mode, layout);
+}
+
+static gboolean
+on_gl_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    gint allocated_width = gtk_widget_get_allocated_width(GTK_WIDGET(area));
+    gint allocated_height = gtk_widget_get_allocated_height(GTK_WIDGET(area));
+    gint scale = gtk_widget_get_scale_factor(GTK_WIDGET(area));
+    if (allocated_width <= 0 || allocated_height <= 0)
+        return TRUE;
+
+    gtk_gl_area_make_current(area);
+    GError *error = gtk_gl_area_get_error(area);
+    if (error != NULL) {
+        use_cairo_fallback(renderer, error->message);
+        return TRUE;
+    }
+    if (!renderer->gl_initialized) {
+        use_cairo_fallback(renderer, "GL resources are not initialized");
+        return TRUE;
+    }
+
+    glViewport(0, 0, allocated_width * scale, allocated_height * scale);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    guint64 generation = 0;
+    GstSample *sample = get_latest_sample(renderer, &generation);
+    if (sample == NULL)
+        return TRUE;
+
+    GstVideoInfo info;
+    GstVideoFrame frame;
+    if (!map_rgba_sample(sample, &info, &frame)) {
+        gst_sample_unref(sample);
+        return TRUE;
+    }
+
+    guint width = GST_VIDEO_INFO_WIDTH(&info);
+    guint height = GST_VIDEO_INFO_HEIGHT(&info);
+    if (generation != renderer->uploaded_generation ||
+        width != renderer->texture_width || height != renderer->texture_height) {
+        gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+        const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
+        if (stride > 0 && stride % 4 == 0) {
+            glBindTexture(GL_TEXTURE_2D, renderer->texture);
+            if (width != renderer->texture_width || height != renderer->texture_height) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width,
+                             (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                renderer->texture_width = width;
+                renderer->texture_height = height;
+            }
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
+                            (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            renderer->uploaded_generation = generation;
+        }
+    }
+
+    CaptureRendererLayout layout;
+    if (layout_for_area(renderer, GTK_WIDGET(area), (guint)allocated_width,
+                        (guint)allocated_height, &layout)) {
+        gfloat x0 = 2.0f * (gfloat)layout.viewport.x / allocated_width - 1.0f;
+        gfloat x1 = 2.0f * (gfloat)(layout.viewport.x + layout.viewport.width) /
+                    allocated_width - 1.0f;
+        gfloat y0 = 1.0f - 2.0f * (gfloat)layout.viewport.y / allocated_height;
+        gfloat y1 = 1.0f - 2.0f * (gfloat)(layout.viewport.y + layout.viewport.height) /
+                    allocated_height;
+        GLfloat vertices[] = {
+            x0, y1, (GLfloat)layout.u0, (GLfloat)layout.v1,
+            x1, y1, (GLfloat)layout.u1, (GLfloat)layout.v1,
+            x0, y0, (GLfloat)layout.u0, (GLfloat)layout.v0,
+            x1, y0, (GLfloat)layout.u1, (GLfloat)layout.v0,
+        };
+        glUseProgram(renderer->program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, renderer->texture);
+        glUniform1i(renderer->sampler_location, 0);
+        glBindVertexArray(renderer->vertex_array);
+        glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
+        glEnableVertexAttribArray((GLuint)renderer->position_location);
+        glVertexAttribPointer((GLuint)renderer->position_location, 2, GL_FLOAT,
+                              GL_FALSE, 4 * sizeof(GLfloat), (void *)0);
+        glEnableVertexAttribArray((GLuint)renderer->texcoord_location);
+        glVertexAttribPointer((GLuint)renderer->texcoord_location, 2, GL_FLOAT,
+                              GL_FALSE, 4 * sizeof(GLfloat),
+                              (void *)(2 * sizeof(GLfloat)));
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(0);
+    }
+
+    gst_video_frame_unmap(&frame);
+    gst_sample_unref(sample);
+    (void)context;
+    return TRUE;
+}
+
+static gboolean
+on_cairo_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    gint width = gtk_widget_get_allocated_width(widget);
+    gint height = gtk_widget_get_allocated_height(widget);
+    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+    cairo_paint(cr);
+    if (width <= 0 || height <= 0)
+        return TRUE;
+
+    guint64 generation = 0;
+    GstSample *sample = get_latest_sample(renderer, &generation);
+    if (sample == NULL)
+        return TRUE;
+
+    GstVideoInfo info;
+    GstVideoFrame frame;
+    if (map_rgba_sample(sample, &info, &frame)) {
+        gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+        const guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
+        CaptureRendererLayout layout;
+        if (stride > 0 && layout_for_area(renderer, widget, (guint)width,
+                                          (guint)height, &layout)) {
+            GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
+                pixels, GDK_COLORSPACE_RGB, TRUE, 8,
+                (gint)GST_VIDEO_INFO_WIDTH(&info),
+                (gint)GST_VIDEO_INFO_HEIGHT(&info), stride, NULL, NULL);
+            if (pixbuf != NULL) {
+                gdouble image_width = layout.viewport.width /
+                                      (layout.u1 - layout.u0);
+                gdouble image_height = layout.viewport.height /
+                                       (layout.v1 - layout.v0);
+                gdouble x = layout.viewport.x - layout.u0 * image_width;
+                gdouble y = layout.viewport.y - layout.v0 * image_height;
+                cairo_save(cr);
+                cairo_rectangle(cr, layout.viewport.x, layout.viewport.y,
+                                layout.viewport.width, layout.viewport.height);
+                cairo_clip(cr);
+                cairo_translate(cr, x, y);
+                cairo_scale(cr, image_width / GST_VIDEO_INFO_WIDTH(&info),
+                            image_height / GST_VIDEO_INFO_HEIGHT(&info));
+                gdk_cairo_set_source_pixbuf(cr, pixbuf, 0, 0);
+                cairo_paint(cr);
+                cairo_restore(cr);
+                g_object_unref(pixbuf);
+            }
+        }
+        gst_video_frame_unmap(&frame);
+    }
+    gst_sample_unref(sample);
+    (void)generation;
+    return TRUE;
+}
+
+static gboolean
+renderer_dispatch(gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    g_mutex_lock(&renderer->sample_mutex);
+    renderer->dispatch_pending = FALSE;
+    gboolean closing = renderer->closing;
+    g_mutex_unlock(&renderer->sample_mutex);
+    if (!closing) {
+        gtk_gl_area_queue_render(GTK_GL_AREA(renderer->gl_area));
+        gtk_widget_queue_draw(renderer->cairo_area);
+    }
+    capture_renderer_unref(renderer);
+    return G_SOURCE_REMOVE;
+}
+
+static GstFlowReturn
+on_new_sample(GstAppSink *sink, gpointer user_data)
+{
+    CaptureRenderer *renderer = user_data;
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    if (sample == NULL)
+        return GST_FLOW_EOS;
+
+    GstVideoInfo info;
+    gboolean valid_caps = gst_sample_get_caps(sample) != NULL &&
+        gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) &&
+        GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_RGBA;
+    GstSample *old_sample = NULL;
+    gboolean schedule_dispatch = FALSE;
+    g_mutex_lock(&renderer->sample_mutex);
+    if (renderer->closing) {
+        g_mutex_unlock(&renderer->sample_mutex);
+        gst_sample_unref(sample);
+        return GST_FLOW_FLUSHING;
+    }
+    if (valid_caps) {
+        renderer->source_width = GST_VIDEO_INFO_WIDTH(&info);
+        renderer->source_height = GST_VIDEO_INFO_HEIGHT(&info);
+        renderer->pixel_aspect_num = GST_VIDEO_INFO_PAR_N(&info);
+        renderer->pixel_aspect_den = GST_VIDEO_INFO_PAR_D(&info);
+        if (renderer->pixel_aspect_num == 0 || renderer->pixel_aspect_den == 0) {
+            renderer->pixel_aspect_num = 1;
+            renderer->pixel_aspect_den = 1;
+        }
+    }
+    old_sample = renderer->latest_sample;
+    renderer->latest_sample = sample;
+    renderer->sample_generation++;
+    if (!renderer->dispatch_pending) {
+        renderer->dispatch_pending = TRUE;
+        schedule_dispatch = TRUE;
+        capture_renderer_ref(renderer);
+    }
+    g_mutex_unlock(&renderer->sample_mutex);
+    if (old_sample != NULL)
+        gst_sample_unref(old_sample);
+    if (schedule_dispatch)
+        g_main_context_invoke_full(renderer->main_context, G_PRIORITY_DEFAULT,
+                                   renderer_dispatch, renderer, NULL);
+    return GST_FLOW_OK;
+}
+
+static CaptureRenderer *
+capture_renderer_ref(CaptureRenderer *renderer)
+{
+    g_atomic_int_inc(&renderer->ref_count);
+    return renderer;
+}
+
+static void
+capture_renderer_unref(CaptureRenderer *renderer)
+{
+    if (!g_atomic_int_dec_and_test(&renderer->ref_count))
+        return;
+    if (renderer->latest_sample != NULL)
+        gst_sample_unref(renderer->latest_sample);
+    if (renderer->sink != NULL)
+        gst_object_unref(renderer->sink);
+    if (renderer->stack != NULL)
+        g_object_unref(renderer->stack);
+    if (renderer->main_context != NULL)
+        g_main_context_unref(renderer->main_context);
+    g_free(renderer->backend_name);
+    g_mutex_clear(&renderer->sample_mutex);
+    g_free(renderer);
+}
+
+CaptureRenderer *
+capture_renderer_new(GError **error)
+{
+    CaptureRenderer *renderer = g_new0(CaptureRenderer, 1);
+    renderer->ref_count = 1;
+    renderer->main_context = g_main_context_ref_thread_default();
+    g_mutex_init(&renderer->sample_mutex);
+    renderer->scale_mode = CAPTURE_RENDERER_FIT;
+    renderer->pixel_aspect_num = 1;
+    renderer->pixel_aspect_den = 1;
+    set_backend_name(renderer, "GtkGLArea/OpenGL (initializing)");
+
+    renderer->stack = gtk_stack_new();
+    if (renderer->stack == NULL) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    "Could not create renderer widget stack");
+        capture_renderer_unref(renderer);
+        return NULL;
+    }
+    g_object_ref_sink(renderer->stack);
+    gtk_stack_set_transition_type(GTK_STACK(renderer->stack), GTK_STACK_TRANSITION_TYPE_NONE);
+    gtk_widget_set_hexpand(renderer->stack, TRUE);
+    gtk_widget_set_vexpand(renderer->stack, TRUE);
+
+    renderer->gl_area = gtk_gl_area_new();
+    gtk_gl_area_set_required_version(GTK_GL_AREA(renderer->gl_area), 3, 2);
+    gtk_gl_area_set_has_depth_buffer(GTK_GL_AREA(renderer->gl_area), FALSE);
+    gtk_gl_area_set_has_stencil_buffer(GTK_GL_AREA(renderer->gl_area), FALSE);
+    gtk_widget_set_hexpand(renderer->gl_area, TRUE);
+    gtk_widget_set_vexpand(renderer->gl_area, TRUE);
+    gtk_widget_set_app_paintable(renderer->gl_area, TRUE);
+    gtk_container_add(GTK_CONTAINER(renderer->stack), renderer->gl_area);
+    g_signal_connect(renderer->gl_area, "realize", G_CALLBACK(on_gl_realize), renderer);
+    g_signal_connect(renderer->gl_area, "unrealize", G_CALLBACK(on_gl_unrealize), renderer);
+    g_signal_connect(renderer->gl_area, "render", G_CALLBACK(on_gl_render), renderer);
+
+    renderer->cairo_area = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(renderer->cairo_area, TRUE);
+    gtk_widget_set_vexpand(renderer->cairo_area, TRUE);
+    gtk_widget_set_app_paintable(renderer->cairo_area, TRUE);
+    gtk_container_add(GTK_CONTAINER(renderer->stack), renderer->cairo_area);
+    g_signal_connect(renderer->cairo_area, "draw", G_CALLBACK(on_cairo_draw), renderer);
+    gtk_stack_set_visible_child(GTK_STACK(renderer->stack), renderer->gl_area);
+    return renderer;
+}
+
+GtkWidget *
+capture_renderer_get_widget(CaptureRenderer *renderer)
+{
+    return renderer->stack;
+}
+
+void
+capture_renderer_connect_motion_events(
+    CaptureRenderer *renderer,
+    gboolean (*callback)(GtkWidget *, GdkEventMotion *, gpointer),
+    gpointer user_data)
+{
+    if (renderer == NULL || callback == NULL)
+        return;
+    if (renderer->gl_motion_handler_id != 0)
+        g_signal_handler_disconnect(renderer->gl_area,
+                                    renderer->gl_motion_handler_id);
+    if (renderer->cairo_motion_handler_id != 0)
+        g_signal_handler_disconnect(renderer->cairo_area,
+                                    renderer->cairo_motion_handler_id);
+    gtk_widget_add_events(renderer->gl_area, GDK_POINTER_MOTION_MASK);
+    gtk_widget_add_events(renderer->cairo_area, GDK_POINTER_MOTION_MASK);
+    renderer->gl_motion_handler_id =
+        g_signal_connect(renderer->gl_area, "motion-notify-event",
+                         G_CALLBACK(callback), user_data);
+    renderer->cairo_motion_handler_id =
+        g_signal_connect(renderer->cairo_area, "motion-notify-event",
+                         G_CALLBACK(callback), user_data);
+}
+
+
+GstElement *
+capture_renderer_create_sink(CaptureRenderer *renderer)
+{
+    if (renderer->sink != NULL)
+        return NULL;
+    GstElement *sink = gst_element_factory_make("appsink", "gtk-video-appsink");
+    if (sink == NULL)
+        return NULL;
+
+    GstCaps *caps = gst_caps_new_simple("video/x-raw",
+                                        "format", G_TYPE_STRING, "RGBA",
+                                        NULL);
+    g_object_set(sink,
+                 "caps", caps,
+                 "max-buffers", 1u,
+                 "drop", TRUE,
+                 "sync", FALSE,
+                 "enable-last-sample", FALSE,
+                 NULL);
+    gst_caps_unref(caps);
+
+    GstAppSinkCallbacks callbacks = {0};
+    callbacks.new_sample = on_new_sample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks,
+                               capture_renderer_ref(renderer),
+                               (GDestroyNotify)capture_renderer_unref);
+    renderer->sink = gst_object_ref(sink);
+    return sink;
+}
+
+void
+capture_renderer_set_scale_mode(CaptureRenderer *renderer,
+                                CaptureRendererScaleMode mode)
+{
+    if (renderer == NULL || (mode != CAPTURE_RENDERER_FIT &&
+                             mode != CAPTURE_RENDERER_FILL))
+        return;
+    g_mutex_lock(&renderer->sample_mutex);
+    renderer->scale_mode = mode;
+    g_mutex_unlock(&renderer->sample_mutex);
+    gtk_gl_area_queue_render(GTK_GL_AREA(renderer->gl_area));
+    gtk_widget_queue_draw(renderer->cairo_area);
+}
+
+void
+capture_renderer_pipeline_stopped(CaptureRenderer *renderer)
+{
+    if (renderer == NULL)
+        return;
+    GstElement *sink = renderer->sink;
+    renderer->sink = NULL;
+    if (sink != NULL) {
+        GstAppSinkCallbacks callbacks = {0};
+        gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, NULL, NULL);
+        gst_object_unref(sink);
+    }
+    g_mutex_lock(&renderer->sample_mutex);
+    GstSample *sample = renderer->latest_sample;
+    renderer->latest_sample = NULL;
+    renderer->source_width = 0;
+    renderer->source_height = 0;
+    renderer->pixel_aspect_num = 1;
+    renderer->pixel_aspect_den = 1;
+    renderer->sample_generation++;
+    g_mutex_unlock(&renderer->sample_mutex);
+    if (sample != NULL)
+        gst_sample_unref(sample);
+    gtk_gl_area_queue_render(GTK_GL_AREA(renderer->gl_area));
+    gtk_widget_queue_draw(renderer->cairo_area);
+}
+
+const gchar *
+capture_renderer_get_backend_name(const CaptureRenderer *renderer)
+{
+    return renderer != NULL ? renderer->backend_name : "unavailable";
+}
+
+void
+capture_renderer_free(CaptureRenderer *renderer)
+{
+    if (renderer == NULL)
+        return;
+    g_mutex_lock(&renderer->sample_mutex);
+    renderer->closing = TRUE;
+    g_mutex_unlock(&renderer->sample_mutex);
+    if (renderer->gl_motion_handler_id != 0)
+        g_signal_handler_disconnect(renderer->gl_area,
+                                    renderer->gl_motion_handler_id);
+    if (renderer->cairo_motion_handler_id != 0)
+        g_signal_handler_disconnect(renderer->cairo_area,
+                                    renderer->cairo_motion_handler_id);
+    renderer->gl_motion_handler_id = 0;
+    renderer->cairo_motion_handler_id = 0;
+    g_signal_handlers_disconnect_by_data(renderer->gl_area, renderer);
+    g_signal_handlers_disconnect_by_data(renderer->cairo_area, renderer);
+    if (renderer->gl_initialized && gtk_widget_get_realized(renderer->gl_area))
+        on_gl_unrealize(GTK_GL_AREA(renderer->gl_area), renderer);
+    capture_renderer_unref(renderer);
+}

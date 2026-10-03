@@ -19,17 +19,30 @@ foreach warning : ['-Wformat=2', '-Wshadow', '-Wstrict-prototypes']
 endforeach
 
 gtk = dependency('gtk+-3.0', required: true)
+glib = dependency('glib-2.0', version: '>=2.74', required: true)
+
 gst = dependency('gstreamer-1.0', required: true)
 gst_video = dependency('gstreamer-video-1.0', required: true)
 gst_audio = dependency('gstreamer-audio-1.0', required: true)
+gst_app = dependency('gstreamer-app-1.0', required: true)
+epoxy = dependency('epoxy', required: true)
+math = cc.find_library('m', required: true)
 
 viewer = executable(
   'captureviewer',
-  ['src/main.c', 'src/capture.c'],
-  dependencies: [gtk, gst, gst_video, gst_audio],
+  ['src/main.c', 'src/capture.c', 'src/renderer.c'],
+  dependencies: [gtk, glib, gst, gst_video, gst_audio, gst_app, epoxy, math],
   c_args: cc_args,
   install: true,
 )
+
+renderer_layout_test = executable(
+  'test-renderer-layout',
+  ['tests/test_renderer_layout.c', 'src/renderer.c'],
+  dependencies: [gtk, gst, gst_video, gst_app, epoxy, math],
+  c_args: cc_args,
+)
+test('renderer-layout', renderer_layout_test)
 
 install_data(
   'data/io.github.wully616.captureviewer.desktop',

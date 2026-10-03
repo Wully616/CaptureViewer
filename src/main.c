@@ -1,11 +1,10 @@
 #define _GNU_SOURCE
 #include "capture.h"
+#include "renderer.h"
 
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
-#include <gdk/gdkx.h>
 #include <gst/gst.h>
-#include <gst/video/videooverlay.h>
 #include <linux/videodev2.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,6 +27,7 @@ struct AppState {
     GtkApplication *application;
     GtkWidget *window;
     GtkWidget *video_area;
+    CaptureRenderer *renderer;
     GtkWidget *root_overlay;
     GtkWidget *settings;
     GtkWidget *control_panel;
@@ -39,6 +39,7 @@ struct AppState {
     GtkWidget *hide_delay_spin;
     GtkWidget *device_label;
     GtkWidget *mode_combo;
+    GtkWidget *scale_combo;
     GtkWidget *audio_toggle;
     GtkWidget *volume_scale;
     GtkWidget *status_label;
@@ -54,6 +55,7 @@ struct AppState {
     gchar *preferred_mode_key;
     gchar *config_path;
     gchar *log_path;
+    gchar *renderer_backend_logged;
     gchar *pipeline_error;
     GstElement *pipeline;
     GstBus *pipeline_bus;
@@ -61,7 +63,6 @@ struct AppState {
     GstElement *video_convert;
     GstElement *fps_sink;
     GstElement *video_sink;
-    guintptr video_window_handle;
     GstElement *audio_source;
     GstElement *audio_sink;
     guint bus_watch_id;
@@ -86,6 +87,7 @@ struct AppState {
     gint64 last_cpu_time_us;
     gdouble volume;
     gboolean audio_enabled;
+    CaptureRendererScaleMode scale_mode;
     gboolean updating_controls;
     guint panel_dwell_ms;
     guint panel_hide_delay_ms;
@@ -108,6 +110,8 @@ struct AppState {
 static void app_refresh_ui(AppState *app);
 static void app_restart_pipeline(AppState *app);
 static void app_log(AppState *app, const gchar *format, ...) G_GNUC_PRINTF(2, 3);
+static void app_log_session_context(AppState *app);
+static void app_log_renderer_backend(AppState *app);
 static void app_show_control_panel(AppState *app);
 static void app_hide_control_panel(AppState *app);
 static void app_schedule_panel_hide(AppState *app);
@@ -153,6 +157,57 @@ app_log(AppState *app, const gchar *format, ...)
     g_free(stamp);
     g_date_time_unref(now);
     g_free(message);
+}
+
+static void
+app_log_session_context(AppState *app)
+{
+    static const gchar *const variables[] = {
+        "XDG_SESSION_TYPE",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "GDK_BACKEND",
+        "GDK_GL",
+        "GDK_DEBUG",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "STEAM_RUNTIME",
+        "STEAM_COMPAT_DATA_PATH",
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH",
+        "STEAM_GAME",
+        "STEAM_PROCESS_NAME",
+        "GAMESCOPE_WAYLAND_DISPLAY",
+        "GAMESCOPE_XWAYLAND_DISPLAY",
+        "PIPEWIRE_REMOTE",
+        "PULSE_SERVER",
+        "LIBGL_ALWAYS_SOFTWARE",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "VK_ICD_FILENAMES",
+    };
+
+    app_log(app, "Application log path: %s", app->log_path);
+    for (guint i = 0; i < G_N_ELEMENTS(variables); i++) {
+        const gchar *value = g_getenv(variables[i]);
+        app_log(app, "Session environment %s=%s", variables[i],
+                value != NULL ? value : "(unset)");
+    }
+
+    GdkDisplay *display = gtk_widget_get_display(app->window);
+    app_log(app, "GDK display type=%s name=%s",
+            display != NULL ? G_OBJECT_TYPE_NAME(display) : "(unavailable)",
+            display != NULL ? gdk_display_get_name(display) : "(unavailable)");
+}
+
+static void
+app_log_renderer_backend(AppState *app)
+{
+    const gchar *backend = capture_renderer_get_backend_name(app->renderer);
+    if (g_strcmp0(app->renderer_backend_logged, backend) == 0)
+        return;
+    g_free(app->renderer_backend_logged);
+    app->renderer_backend_logged = g_strdup(backend);
+    app_log(app, "Selected video renderer: %s", backend);
 }
 
 static gboolean
@@ -303,6 +358,8 @@ app_save_preferences(AppState *app)
     g_key_file_set_boolean(key_file, "ui", "stats-visible", app->stats_visible);
     g_key_file_set_integer(key_file, "ui", "dwell-ms", app->panel_dwell_ms);
     g_key_file_set_integer(key_file, "ui", "hide-delay-ms", app->panel_hide_delay_ms);
+    g_key_file_set_string(key_file, "ui", "scaling-mode",
+                          app->scale_mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
     gsize length = 0;
     gchar *contents = g_key_file_to_data(key_file, &length, NULL);
     gchar *directory = g_path_get_dirname(app->config_path);
@@ -466,18 +523,16 @@ setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
     GstElement *source = gst_element_factory_make("v4l2src", "capture-source");
     GstElement *capsfilter = gst_element_factory_make("capsfilter", "capture-mode");
     GstElement *queue = gst_element_factory_make("queue", "latest-frame-queue");
-    GstElement *scale = gst_element_factory_make("videoscale", "display-scale");
     GstElement *convert = gst_element_factory_make("videoconvert", "video-convert");
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "display-metrics");
-    GstElement *sink = gst_element_factory_make("ximagesink", "headset-video-sink");
-    if (source == NULL || capsfilter == NULL || queue == NULL || scale == NULL ||
+    GstElement *sink = capture_renderer_create_sink(app->renderer);
+    if (source == NULL || capsfilter == NULL || queue == NULL ||
         convert == NULL || fps == NULL || sink == NULL) {
         g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_MISSING_PLUGIN,
-                    "Required video elements v4l2src/capsfilter/queue/videoscale/videoconvert/fpsdisplaysink/ximagesink are unavailable");
+                    "Required video elements v4l2src/capsfilter/queue/videoconvert/fpsdisplaysink/appsink are unavailable");
         if (source) gst_object_unref(source);
         if (capsfilter) gst_object_unref(capsfilter);
         if (queue) gst_object_unref(queue);
-        if (scale) gst_object_unref(scale);
         if (convert) gst_object_unref(convert);
         if (fps) gst_object_unref(fps);
         if (sink) gst_object_unref(sink);
@@ -490,7 +545,6 @@ setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
                     "Unsupported V4L2 format %s for GStreamer", mode->format_name);
         gst_object_unref(source);
         gst_object_unref(capsfilter);
-        gst_object_unref(scale);
         gst_object_unref(queue);
         gst_object_unref(convert);
         gst_object_unref(fps);
@@ -505,14 +559,6 @@ setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
         "max-size-bytes", 0,
         "max-size-time", (guint64)0,
         "leaky", 2,
-        NULL);
-    g_object_set(sink,
-        "sync", FALSE,
-        "qos", TRUE,
-        "max-lateness", (gint64)10000000,
-        "handle-events", FALSE,
-        "handle-expose", FALSE,
-        "force-aspect-ratio", TRUE,
         NULL);
     g_object_set(fps,
         "video-sink", sink,
@@ -536,28 +582,30 @@ setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
         gst_object_unref(capsfilter);
         gst_object_unref(queue);
         gst_object_unref(convert);
-        gst_object_unref(scale);
         gst_object_unref(fps);
         gst_object_unref(sink);
         return FALSE;
     }
 
-    gst_bin_add_many(GST_BIN(app->pipeline), source, capsfilter, queue, scale,
-                     convert, NULL);
+    gst_bin_add_many(GST_BIN(app->pipeline), source, capsfilter, queue, convert, NULL);
     if (decoder != NULL)
         gst_bin_add(GST_BIN(app->pipeline), decoder);
     gst_bin_add(GST_BIN(app->pipeline), fps);
 
+    app->video_queue = queue;
+    app->video_convert = convert;
+    app->fps_sink = fps;
+    app->video_sink = sink;
+
     gboolean linked = FALSE;
     if (decoder == NULL) {
-        linked = gst_element_link_many(source, capsfilter, queue, scale, convert,
-                                       fps, NULL);
+        linked = gst_element_link_many(source, capsfilter, queue, convert, fps, NULL);
     } else if (is_mjpeg_mode(mode)) {
-        linked = gst_element_link_many(source, capsfilter, queue, decoder, scale,
-                                       convert, fps, NULL);
+        linked = gst_element_link_many(source, capsfilter, queue, decoder, convert,
+                                       fps, NULL);
     } else {
         linked = gst_element_link_many(source, capsfilter, queue, decoder, NULL) &&
-                 gst_element_link_many(scale, convert, fps, NULL);
+                 gst_element_link(convert, fps);
         if (linked)
             g_signal_connect(decoder, "pad-added", G_CALLBACK(on_decode_pad_added), app);
     }
@@ -567,17 +615,7 @@ setup_video_branch(AppState *app, const CaptureMode *mode, GError **error)
         return FALSE;
     }
 
-    app->video_queue = queue;
-    app->video_convert = convert;
-    app->fps_sink = fps;
-    g_object_get(fps, "video-sink", &app->video_sink, NULL);
-    if (app->video_sink == NULL || !GST_IS_VIDEO_OVERLAY(app->video_sink)) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
-                    "The selected GStreamer video sink cannot render into the viewer window");
-        return FALSE;
-    }
     g_signal_connect(fps, "fps-measurements", G_CALLBACK(on_fps_measurements), app);
-    gst_video_overlay_handle_events(GST_VIDEO_OVERLAY(app->video_sink), FALSE);
     return TRUE;
 }
 
@@ -632,46 +670,6 @@ setup_audio_branch(AppState *app, GError **error)
     return TRUE;
 }
 
-static gboolean
-bind_video_window(AppState *app, GError **error)
-{
-    if (app->video_area == NULL || !gtk_widget_get_realized(app->video_area)) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
-                    "Video display area has not been realized yet");
-        return FALSE;
-    }
-    GdkWindow *window = gtk_widget_get_window(app->video_area);
-    if (window == NULL || !GDK_IS_X11_DISPLAY(gdk_window_get_display(window))) {
-        g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
-                    "Video overlay requires the active X11 Gamescope display");
-        return FALSE;
-    }
-    gdk_window_lower(window);
-    app->video_window_handle = (guintptr)gdk_x11_window_get_xid(window);
-    return TRUE;
-}
-
-
-
-static GstBusSyncReply
-pipeline_sync_message(GstBus *bus, GstMessage *message, gpointer user_data)
-{
-    AppState *app = user_data;
-    (void)bus;
-    GstObject *source = GST_MESSAGE_SRC(message);
-    /* This bus also receives messages from pads and audio ring buffers. */
-    if (source == NULL || !GST_IS_ELEMENT(source) ||
-        app->video_window_handle == 0 ||
-        !gst_is_video_overlay_prepare_window_handle_message(message) ||
-        !GST_IS_VIDEO_OVERLAY(source))
-        return GST_BUS_PASS;
-
-    app_log(app, "Binding GStreamer video window handle %" G_GUINTPTR_FORMAT,
-            app->video_window_handle);
-    gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(source),
-                                        app->video_window_handle);
-    return GST_BUS_DROP;
-}
 
 static void
 pipeline_stop(AppState *app)
@@ -680,11 +678,20 @@ pipeline_stop(AppState *app)
         g_source_remove(app->bus_watch_id);
         app->bus_watch_id = 0;
     }
-    if (app->pipeline_bus != NULL)
-        gst_bus_set_sync_handler(app->pipeline_bus, NULL, NULL, NULL);
     if (app->pipeline != NULL) {
+        GstState state = GST_STATE_VOID_PENDING;
         gst_element_set_state(app->pipeline, GST_STATE_NULL);
+        GstStateChangeReturn state_result =
+            gst_element_get_state(app->pipeline, &state, NULL, GST_CLOCK_TIME_NONE);
+        if (app->renderer != NULL && state_result != GST_STATE_CHANGE_FAILURE &&
+            state == GST_STATE_NULL) {
+            capture_renderer_pipeline_stopped(app->renderer);
+        } else if (app->renderer != NULL) {
+            app_log(app, "Renderer teardown deferred: GStreamer pipeline did not reach NULL");
+        }
         gst_object_unref(app->pipeline);
+    } else if (app->renderer != NULL) {
+        capture_renderer_pipeline_stopped(app->renderer);
     }
     if (app->pipeline_bus != NULL)
         gst_object_unref(app->pipeline_bus);
@@ -794,8 +801,7 @@ pipeline_start(AppState *app)
     }
 
     if (!setup_video_branch(app, mode, &error) ||
-        !setup_audio_branch(app, &error) ||
-        !bind_video_window(app, &error)) {
+        !setup_audio_branch(app, &error)) {
         app_log(app, "Pipeline setup failed: %s", error ? error->message : "unknown error");
         g_free(app->pipeline_error);
         app->pipeline_error = g_strdup(error ? error->message : "Pipeline setup failed");
@@ -806,7 +812,6 @@ pipeline_start(AppState *app)
     }
 
     app->pipeline_bus = gst_element_get_bus(app->pipeline);
-    gst_bus_set_sync_handler(app->pipeline_bus, pipeline_sync_message, app, NULL);
     app->bus_watch_id = gst_bus_add_watch(app->pipeline_bus, pipeline_bus_message, app);
     GstStateChangeReturn state = gst_element_set_state(app->pipeline, GST_STATE_PLAYING);
     if (state == GST_STATE_CHANGE_FAILURE) {
@@ -819,6 +824,7 @@ pipeline_start(AppState *app)
         return FALSE;
     }
 
+    app_log_renderer_backend(app);
     g_free(app->pipeline_error);
     app->pipeline_error = NULL;
     app_log(app, "Started %s on %s; audio %s%s", mode->label,
@@ -1054,6 +1060,7 @@ stats_update(gpointer user_data)
         app->latency_max_ns = max_latency;
         g_mutex_unlock(&app->stats_mutex);
     }
+    app_log_renderer_backend(app);
     app_refresh_ui(app);
     return G_SOURCE_CONTINUE;
 }
@@ -1236,6 +1243,27 @@ audio_toggled(GtkToggleButton *button, gpointer user_data)
     app_schedule_preference_save(app);
     app_log(app, "HDMI audio %s", app->audio_enabled ? "enabled" : "disabled");
     app_restart_pipeline(app);
+}
+
+static void
+scaling_mode_changed(GtkComboBox *combo, gpointer user_data)
+{
+    AppState *app = user_data;
+    if (app->updating_controls)
+        return;
+
+    const gchar *mode_id = gtk_combo_box_get_active_id(combo);
+    CaptureRendererScaleMode mode =
+        g_strcmp0(mode_id, "fill") == 0 ? CAPTURE_RENDERER_FILL
+                                        : CAPTURE_RENDERER_FIT;
+    if (mode == app->scale_mode)
+        return;
+
+    app->scale_mode = mode;
+    capture_renderer_set_scale_mode(app->renderer, mode);
+    app_schedule_preference_save(app);
+    app_log(app, "Video scaling mode set to %s",
+            mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
 }
 
 static void
@@ -1604,6 +1632,20 @@ create_settings(AppState *app)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(app->hide_delay_spin), app->panel_hide_delay_ms);
     gtk_grid_attach(GTK_GRID(grid), app->hide_delay_spin, 1, 4, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("ms outside panel"), 2, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Video scaling"), 0, 5, 1, 1);
+    app->scale_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->scale_combo),
+                              "fit", "Fit entire frame");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->scale_combo),
+                              "fill", "Fill screen, crop edges");
+    app->updating_controls = TRUE;
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->scale_combo),
+                                app->scale_mode == CAPTURE_RENDERER_FILL ? "fill" : "fit");
+    app->updating_controls = FALSE;
+    gtk_widget_set_size_request(app->scale_combo, 260, 48);
+    gtk_grid_attach(GTK_GRID(grid), app->scale_combo, 1, 5, 2, 1);
+    g_signal_connect(app->scale_combo, "changed",
+                     G_CALLBACK(scaling_mode_changed), app);
     g_signal_connect(app->dwell_spin, "value-changed", G_CALLBACK(dwell_changed), app);
     g_signal_connect(app->hide_delay_spin, "value-changed", G_CALLBACK(hide_delay_changed), app);
     GtkWidget *close = gtk_button_new_with_label("Close");
@@ -1761,20 +1803,34 @@ app_activate(GtkApplication *application, gpointer user_data)
 {
     AppState *app = user_data;
     app->application = application;
+    if (app->window != NULL) {
+        gtk_window_present(GTK_WINDOW(app->window));
+        return;
+    }
     app->window = gtk_application_window_new(application);
     gtk_window_set_title(GTK_WINDOW(app->window), "CaptureViewer");
     gtk_window_set_default_size(GTK_WINDOW(app->window), 1280, 720);
     gtk_widget_set_can_focus(app->window, TRUE);
     gtk_widget_set_app_paintable(app->window, TRUE);
     g_signal_connect(app->window, "key-press-event", G_CALLBACK(key_press), app);
+    GError *renderer_error = NULL;
+    app->renderer = capture_renderer_new(&renderer_error);
+    if (app->renderer == NULL) {
+        app_log(app, "Could not create video renderer: %s",
+                renderer_error != NULL ? renderer_error->message : "unknown error");
+        g_clear_error(&renderer_error);
+        g_application_quit(G_APPLICATION(application));
+        return;
+    }
+    capture_renderer_set_scale_mode(app->renderer, app->scale_mode);
+    capture_renderer_connect_motion_events(app->renderer, window_motion, app);
     app->root_overlay = gtk_overlay_new();
-    app->video_area = gtk_drawing_area_new();
-    gtk_widget_set_has_window(app->video_area, TRUE);
+    app->video_area = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->video_area), FALSE);
     gtk_widget_set_hexpand(app->video_area, TRUE);
     gtk_widget_set_vexpand(app->video_area, TRUE);
-    gtk_widget_add_events(app->video_area, GDK_POINTER_MOTION_MASK);
-    g_signal_connect(app->video_area, "motion-notify-event",
-                     G_CALLBACK(window_motion), app);
+    gtk_container_add(GTK_CONTAINER(app->video_area),
+                      capture_renderer_get_widget(app->renderer));
     gtk_container_add(GTK_CONTAINER(app->root_overlay), app->video_area);
     gtk_container_add(GTK_CONTAINER(app->window), app->root_overlay);
     create_control_panel(app);
@@ -1788,6 +1844,8 @@ app_activate(GtkApplication *application, gpointer user_data)
     gtk_widget_grab_focus(app->window);
     gtk_window_fullscreen(GTK_WINDOW(app->window));
     gtk_window_present(GTK_WINDOW(app->window));
+    app_log_session_context(app);
+    app_log_renderer_backend(app);
     app->fullscreen = TRUE;
     app->device_monitor = gst_device_monitor_new();
     GstCaps *audio_caps = gst_caps_new_empty_simple("audio/x-raw");
@@ -1830,6 +1888,10 @@ app_shutdown(GApplication *application, gpointer user_data)
     if (app->device_watch_id != 0)
         g_source_remove(app->device_watch_id);
     pipeline_stop(app);
+    if (app->renderer != NULL) {
+        capture_renderer_free(app->renderer);
+        app->renderer = NULL;
+    }
     if (app->device_monitor != NULL) {
         gst_device_monitor_stop(app->device_monitor);
         gst_object_unref(app->device_monitor);
@@ -1846,6 +1908,7 @@ app_shutdown(GApplication *application, gpointer user_data)
     g_free(app->preferred_mode_key);
     g_free(app->config_path);
     g_free(app->pipeline_error);
+    g_free(app->renderer_backend_logged);
     app_log(app, "Viewer shut down cleanly");
     g_free(app->log_path);
     g_mutex_clear(&app->stats_mutex);
@@ -1946,11 +2009,16 @@ main(int argc, char **argv)
             if (delay >= 500 && delay <= 1000)
                 app.panel_hide_delay_ms = (guint)delay;
         }
+        gchar *stored_scale_mode =
+            g_key_file_get_string(key_file, "ui", "scaling-mode", NULL);
+        app.scale_mode = g_strcmp0(stored_scale_mode, "fill") == 0
+            ? CAPTURE_RENDERER_FILL : CAPTURE_RENDERER_FIT;
+        g_free(stored_scale_mode);
     }
     g_free(legacy_config_path);
     g_key_file_unref(key_file);
     GtkApplication *application = gtk_application_new("io.github.wully616.captureviewer",
-                                                       G_APPLICATION_NON_UNIQUE);
+                                                       G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "activate", G_CALLBACK(app_activate), &app);
     g_signal_connect(application, "shutdown", G_CALLBACK(app_shutdown), &app);
     gint status = g_application_run(G_APPLICATION(application), argc, argv);
