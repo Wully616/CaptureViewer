@@ -17,6 +17,27 @@ Historical measurements from prior hardware runs (not measurements from the curr
 
 These figures describe specific earlier runs, not a performance guarantee. GStreamer pipeline-reported latency is not HDMI-to-eye end-to-end latency and is deliberately not presented as such.
 
+### Current performance/audio investigation (2026-10-03)
+
+Measured on the Steam Frame desktop/X11 session with active Hagibis UHC07 MJPEG 1280×720 at 60 fps; SteamVR was not launched in this run.
+
+| Run | CPU | FPS / average | Video drops | Audio warnings | Pipeline-reported latency |
+| --- | ---: | ---: | ---: | --- | --- |
+| Baseline: RGBA renderer, `pulsesink sync=true` | ~65% | 59.8 / 59.4 | 0 | Repeated startup warnings | ~80–170 ms |
+| After I420 GL rendering and `pulsesink sync=false` | ~41–44% | 59.6–60.1 / 59.3–59.9 | 0 | No recurring warnings; one app startup emitted a single warning | Not comparable (`sync=false` reports ≥0 ms) |
+
+The optimized run used about 99.4 MiB RSS versus 101.6 MiB at baseline. The MJPEG decoder remains `jpegdec` backed by libjpeg-turbo; the hottest remaining video profile stacks are in `jpeg_read_raw_data`. The one-buffer, downstream-leaky video queue is unchanged. GL rendering now negotiates I420 from `jpegdec`, uploads Y/U/V planes, and performs YUV-to-RGB conversion and scaling in the existing GtkGLArea shader. Cairo fallback negotiates RGBA. These measurements are from normal desktop mode; the new I420 shader path was not exercised in a SteamVR-launched session.
+
+An eight-second per-thread task-clock sample after optimization measured the video `latest-frame-queue` thread at about 0.22 CPU, versus 0.004 for `audio-bounded-queue`, 0.003 for `capture-audio-source`, and 0.002 for `audiosrc-ringbuffer`. Some thread events were not counted; the measured audio threads were not CPU-saturated at steady state.
+
+The same captured JPEG decoded with libjpeg-turbo's SIMD-enabled `tjbench` at 269.5 Mpixels/s, versus 120.8 Mpixels/s with `JSIMD_FORCENONE=1`. This isolates SIMD dispatch in libjpeg-turbo; it is not an application CPU comparison.
+
+The warning originates at `GstPulseSrc` and says downstream consumption is too slow. The exact audio-only branch reproduced repeated warnings with `pulsesink sync=true` (about six in four seconds) and none during a four-second `sync=false` run, so video decoding/rendering was not required to trigger it. In the app, `sync=false` removed recurring warnings; one startup still logged a single 3,528-sample (80 ms) overrun. This supports startup downstream backpressure as the warning cause, but audible crackling was not listened for in this run.
+
+Audio uses the device-created `GstPulseSrc` → non-leaky queue (4 buffers, 50 ms maximum) → `audioconvert` → `audioresample` → `pulsesink` (60 ms buffer request, 20 ms latency request, `sync=false`). The app streams negotiated S16LE stereo at 44.1 kHz; the physical capture and default output endpoints are 48 kHz, with conversion handled by the PipeWire PulseAudio-compatibility layer. The selected GStreamer clock was `GstSystemClock`, and the source has `provide-clock=false`; the reported source buffer/latency were 80/20 ms. GStreamer native PipeWire elements were not installed, so no native-PipeWire A/B was possible. Increasing the requested source buffer from 60 to 100 ms or the queue limit from 50 to 80 ms did not stop the repeated `sync=true` warnings; those latency increases were rejected.
+
+Pipeline latency is not HDMI-to-eye latency. The post-change `sync=false` latency query is not comparable to baseline, and no end-to-end video or audio latency was measured. The audio stream was not acoustically validated; verify with continuous HDMI audio on the Frame speakers for several minutes before treating crackling as resolved.
+
 ### Steam Frame UVC driver caveat
 
 In the SteamOS test environment, a headset reboot previously cleared a session-only `uvcvideo` compatibility-module load and left the tested USB video interfaces unbound; they were available again after a later driver load/bind. Capture therefore depends on a compatible host UVC driver being available and bound on that system. This is a platform-specific observed caveat, not a claim that custom compatibility modules are required on Linux generally. CaptureViewer never loads or installs kernel modules, changes boot configuration, or modifies the kernel. Separate UVC module work is not part of this repository.
