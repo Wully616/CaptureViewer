@@ -2,13 +2,13 @@
 
 CaptureViewer is a lightweight, low-latency Linux video-capture viewer built with native C, GTK 3, and GStreamer. It is designed for VR viewing, with the Steam Frame as the primary development and test platform. This is a hobby/development project, not official Steam Frame support.
 
-V4L2 provides capture-device access and mode enumeration; GStreamer handles video and HDMI audio. The fullscreen/windowed viewer has a pointer- and VR-pointer-friendly auto-hiding control panel, dynamic mode selection, audio monitoring controls, capture statistics, settings/diagnostics, and device reconnect handling. Bounded queues prioritize low latency.
+V4L2 provides capture-device access and mode enumeration; GStreamer handles video and audio. The fullscreen/windowed viewer has a pointer- and VR-pointer-friendly auto-hiding control panel, per-device source and mode selection, Fit/Fill scaling, audio controls, capture statistics, diagnostics, and device reconnect handling. Bounded queues prioritize low latency.
 
 ## Hardware and current status
 
-The tested hardware profile is a Hagibis UHC07 / MACROSILICON capture card (USB VID `345f`, PID `2130`) with an Amazon Fire TV source on Steam Frame. The current device discovery and audio pairing are explicitly matched to that USB identity. Other V4L2/UVC capture cards are potential targets, but have not been tested or verified by this project.
+The V4L2 scanner groups streaming-capture nodes by their physical USB/sysfs device and assigns stable identities. At startup, CaptureViewer prefers the tested Hagibis UHC07 (USB VID `345f`, PID `2130`) when it has a usable mode; otherwise it chooses the first USB-backed device with a mode its GStreamer pipeline can construct. The **Advanced** source option exposes non-USB V4L2 nodes. Other capture cards are potential targets, but have not been tested or verified by this project.
 
-The application enumerates the tested device's advertised capture modes at runtime and remembers the selected mode. HDMI audio is captured separately and routed to the host's default output. Switch and Steam Deck inputs are potential uses only; they have not been verified.
+The source, interface (when multiple interfaces are present), format, resolution, and frame-rate selectors use advertised modes that have a usable GStreamer decoder path. The exact mode preference is remembered per device. HDMI audio is a separate source: **Auto** pairs it with the selected capture device only when the USB identity is unambiguous; **None** disables it, and an explicit source can be selected. User-reported testing with a Switch confirmed video, mode/resolution selection, audio playback, and audio-source switching; intermittent audio skips/crackling remain, and other external capture devices are unverified.
 
 Historical measurements from prior hardware runs (not measurements from the current environment):
 
@@ -23,17 +23,17 @@ In the SteamOS test environment, a headset reboot previously cleared a session-o
 
 ### Platform limitations
 
-The GTK renderer uses OpenGL when available and falls back to Cairo; it no longer depends on GStreamer `ximagesink`. SteamVR launch, OpenGL initialization, Switch video/audio, and FIT/FILL have been verified in a Gamescope/Xwayland session. Wayland-only playback is not yet validated, and the Flatpak manifest currently exposes X11 only. Device access and audio routing depend on the host. Flatpak permissions alone do not prove real hardware capture or audio routing in the sandbox. Steam Frame is the primary development/test platform; there is no claim of SteamOS/Discover certification or a published distribution.
+The GTK renderer uses OpenGL when available and falls back to Cairo; it no longer depends on GStreamer `ximagesink`. SteamVR launch is user-reported to work. Switch video/mode selection and audio playback/source switching work, with occasional skips/crackle whose cause is not established. FIT/FILL switching behaves as expected, and compositor scaling of the fixed-resolution app showed no visible issues. User reports desktop-launched FIT/FILL video follows window resizing. The control panel and stats overlay previously clipped during resize; responsive wrapping and scrolling are implemented and exercised with a GTK allocation smoke test at 1280×720, 800×600, 640×480, and 480×320. The user reports that the rebuilt panel and stats overlay now appear to remain accessible while resizing in the desktop session. Exact all-edge FIT and symmetric FILL crop remain unverified. Layout geometry is covered by unit tests. Wayland-only playback is not yet validated, and the Flatpak manifest currently exposes X11 only. Device access and audio routing depend on the host. Flatpak permissions alone do not prove real hardware capture or audio routing in the sandbox. Steam Frame is the primary development/test platform; there is no confirmed support for other UVC devices.
 
 ## Controls and behavior
 
-The application starts fullscreen. Use **S** to show or hide the auto-hiding control panel, **F11** to toggle fullscreen, and **Q** or the panel's **Quit** button to exit. **Escape** closes an open settings dialog or submenu first; otherwise it exits fullscreen or hides the panel. Escape never quits the application. The panel provides dynamic capture-mode selection, HDMI audio enable/volume, fullscreen, settings, stats, and pin controls. Settings includes diagnostics, panel timing controls, and video scaling (**Fit** or **Fill**). Statistics label GStreamer latency as pipeline-reported, not end-to-end.
+The application starts fullscreen. Use **S** to show or hide the auto-hiding control panel, **F11** to toggle fullscreen, and **Q** or the panel's **Quit** button to exit. **Escape** closes an open settings dialog or submenu first; otherwise it exits fullscreen or hides the panel. Escape never quits the application. The panel provides source/interface and format/resolution/frame-rate selection, audio enable/volume, fullscreen, settings, stats, and pin controls; at narrower widths the panel wraps and scrolls when needed, and stats text wraps and scrolls to remain within the window. Advanced settings expose non-USB sources and audio-source selection (**Auto**, **None**, or an explicit device). Diagnostics show physical/device identity, V4L2 driver and capabilities, selected/expected/negotiated mode caps, renderer/decoder path, audio route, pipeline state/error with GStreamer debug details, and the log path. If the pipeline receives no buffers, the viewer reports waiting for frames; it does not infer HDMI signal state from black pixels. Statistics label GStreamer latency as pipeline-reported, not end-to-end.
 
-HDMI audio is captured separately from video and routed through GStreamer's PulseAudio-compatible `pulsesink` to the host's default output. The intended Steam Frame route is its speakers. The quick-panel toggle and HDMI volume slider affect captured HDMI audio only; actual availability and routing depend on the host audio service and sandbox permissions.
+Audio is captured separately from video and routed through GStreamer's PulseAudio-compatible `pulsesink` to the host's default output. The intended Steam Frame route is its speakers. Automatic association requires a unique USB match; if none is available, audio remains disabled rather than guessing. The quick-panel toggle and volume slider affect the selected audio source; actual availability and routing depend on the host audio service and sandbox permissions.
 
 ## Configuration and logs
 
-Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/.config/captureviewer/config.ini`). On first launch after the rename, if the new config file does not exist and the prior `$XDG_CONFIG_HOME/hagibis-viewer/config.ini` exists and is readable, CaptureViewer copies its parsed settings to the new location. The old file is left untouched. Existing diagnostic logs under `$XDG_DATA_HOME/hagibis-viewer/` are also left untouched; new logs go to `$XDG_DATA_HOME/captureviewer/captureviewer.log` (normally `~/.local/share/captureviewer/captureviewer.log`).
+Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/.config/captureviewer/config.ini`). Device selection uses stable identity with a physical-device fallback, and exact mode preferences are kept per capture device. On first launch after the rename, if the new config file does not exist and the prior `$XDG_CONFIG_HOME/hagibis-viewer/config.ini` exists and is readable, CaptureViewer copies its parsed settings to the new location. The old file is left untouched. Existing diagnostic logs under `$XDG_DATA_HOME/hagibis-viewer/` are also left untouched; new logs go to `$XDG_DATA_HOME/captureviewer/captureviewer.log` (normally `~/.local/share/captureviewer/captureviewer.log`). Pipeline errors record the selected capture context and GStreamer debug details; Advanced settings display the latest error.
 
 ## Screenshot
 
@@ -45,7 +45,7 @@ Settings are stored at `$XDG_CONFIG_HOME/captureviewer/config.ini` (normally `~/
 
 A C11 compiler, Meson (0.60 or newer), Ninja, and pkg-config are needed, along with development packages discoverable via pkg-config for:
 
-- GTK 3 (`gtk+-3.0`)
+- GTK 3.22 or newer (`gtk+-3.0`)
 - GLib 2.74 or newer (`glib-2.0`)
 - GStreamer core (`gstreamer-1.0`)
 - GStreamer video (`gstreamer-video-1.0`)
@@ -73,7 +73,7 @@ meson compile -C build-release
 ./build-release/captureviewer
 ```
 
-List supported modes for the currently recognized capture card with `./build/captureviewer --list-modes`. Meson build directories are independent; install to a chosen prefix with `meson install -C build --destdir "$PWD/stage"`. The desktop entry, AppStream metadata, and scalable icon install under the standard data directories.
+List discovered V4L2 devices, their advertised capture modes, and whether each mode has a usable GStreamer path with `./build/captureviewer --list-modes`. Meson build directories are independent; install to a chosen prefix with `meson install -C build --destdir "$PWD/stage"`. The desktop entry, AppStream metadata, and scalable icon install under the standard data directories.
 
 ## Packaging and identity
 

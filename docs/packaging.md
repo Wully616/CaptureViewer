@@ -16,6 +16,6 @@ GApplication and Flatpak use application ID `io.github.wully616.captureviewer`; 
 
 - Build the Flatpak manifest with the Freedesktop 25.08 runtime/SDK and validate it with the relevant Flatpak and AppStream tools.
 - Inspect staged install paths and verify that desktop, icon, AppStream, and executable identities remain consistent.
-- Test discovery/access to the actual Hagibis UVC device, GTK-rendered video capture, audio capture and playback, configuration migration/persistence, hover controls, settings, and disconnect/reconnect on Steam Frame hardware.
+- On Steam Frame hardware, verify the exact format/resolution/frame-rate selectors, per-device preference persistence, interface selection where applicable, USB audio auto-matching and explicit **None/device** choices, playback, diagnostics from a real error, hover controls, and unplug/reconnect behavior. With the capture card connected but HDMI absent, confirm the app stays alive and reports waiting for frames without claiming signal state; test frame delivery only with an active HDMI source. An advertised mode or successful enumeration is not proof of stream negotiation or frame delivery.
 - Confirm Flatpak permissions are acceptable and sufficiently narrow; investigate whether deployment supports narrower video-device access than `--device=all`.
 - Obtain the project's source-license decision before distribution.

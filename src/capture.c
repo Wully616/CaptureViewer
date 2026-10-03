@@ -12,8 +12,6 @@
 #include <unistd.h>
 #include <dirent.h>
 
-#define HAGIBIS_VENDOR 0x345f
-#define HAGIBIS_PRODUCT 0x2130
 #define MAX_SIZE_EXPANSION 10000
 #define MAX_INTERVAL_EXPANSION 100000
 
@@ -33,32 +31,49 @@ read_sysfs_attribute(const gchar *base, const gchar *name)
 }
 
 static gboolean
-read_usb_ids(const gchar *start, gchar **usb_path, gchar **manufacturer,
-             gchar **product, gchar **serial)
+parse_usb_id(const gchar *value, guint16 *id)
+{
+    if (value == NULL || id == NULL || *value == '\0')
+        return FALSE;
+    gchar *end = NULL;
+    guint64 parsed = g_ascii_strtoull(value, &end, 16);
+    if (end == value || *end != '\0' || parsed > G_MAXUINT16)
+        return FALSE;
+    *id = (guint16)parsed;
+    return TRUE;
+}
+
+static gboolean
+find_usb_parent(const gchar *start, gchar **usb_sysfs, guint16 *vendor_id,
+                guint16 *product_id, gchar **manufacturer, gchar **product,
+                gchar **serial)
 {
     gchar *path = g_strdup(start);
-    gboolean found = FALSE;
-
     while (path != NULL) {
         gchar *vendor = read_sysfs_attribute(path, "idVendor");
-        gchar *product_id = read_sysfs_attribute(path, "idProduct");
-        if (vendor != NULL && product_id != NULL &&
-            g_ascii_strtoull(vendor, NULL, 16) == HAGIBIS_VENDOR &&
-            g_ascii_strtoull(product_id, NULL, 16) == HAGIBIS_PRODUCT) {
-            if (usb_path != NULL)
-                *usb_path = g_strdup(path);
-            if (manufacturer != NULL)
-                *manufacturer = read_sysfs_attribute(path, "manufacturer");
-            if (product != NULL)
-                *product = read_sysfs_attribute(path, "product");
-            if (serial != NULL)
-                *serial = read_sysfs_attribute(path, "serial");
-            found = TRUE;
-        }
+        gchar *product_value = read_sysfs_attribute(path, "idProduct");
+        guint16 parsed_vendor = 0;
+        guint16 parsed_product = 0;
+        gboolean found = parse_usb_id(vendor, &parsed_vendor) &&
+                         parse_usb_id(product_value, &parsed_product);
         g_free(vendor);
-        g_free(product_id);
-        if (found)
-            break;
+        g_free(product_value);
+        if (found) {
+            *usb_sysfs = g_strdup(path);
+            *vendor_id = parsed_vendor;
+            *product_id = parsed_product;
+            *manufacturer = read_sysfs_attribute(path, "manufacturer");
+            *product = read_sysfs_attribute(path, "product");
+            *serial = read_sysfs_attribute(path, "serial");
+            if (*manufacturer != NULL && **manufacturer == '\0')
+                g_clear_pointer(manufacturer, g_free);
+            if (*product != NULL && **product == '\0')
+                g_clear_pointer(product, g_free);
+            if (*serial != NULL && **serial == '\0')
+                g_clear_pointer(serial, g_free);
+            g_free(path);
+            return TRUE;
+        }
 
         gchar *parent = g_path_get_dirname(path);
         if (g_str_equal(parent, path)) {
@@ -69,61 +84,199 @@ read_usb_ids(const gchar *start, gchar **usb_path, gchar **manufacturer,
         path = parent;
     }
     g_free(path);
-    return found;
-}
-
-gboolean
-capture_hagibis_usb_detected(void)
-{
-    DIR *dir = opendir("/sys/bus/usb/devices");
-    if (dir == NULL)
-        return FALSE;
-
-    gboolean detected = FALSE;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        gchar *path = g_build_filename("/sys/bus/usb/devices", entry->d_name, NULL);
-        gchar *vendor = read_sysfs_attribute(path, "idVendor");
-        gchar *product = read_sysfs_attribute(path, "idProduct");
-        detected = vendor != NULL && product != NULL &&
-            g_ascii_strtoull(vendor, NULL, 16) == HAGIBIS_VENDOR &&
-            g_ascii_strtoull(product, NULL, 16) == HAGIBIS_PRODUCT;
-        g_free(vendor);
-        g_free(product);
-        g_free(path);
-        if (detected)
-            break;
-    }
-    closedir(dir);
-    return detected;
+    return FALSE;
 }
 
 static gboolean
-query_capture_type(const gchar *path, enum v4l2_buf_type *type)
+video_class_entry(const gchar *name)
 {
-    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0)
+    if (!g_str_has_prefix(name, "video") || name[5] == '\0')
         return FALSE;
-
-    struct v4l2_capability cap = {0};
-    gboolean found = FALSE;
-    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-        guint32 caps = cap.capabilities & V4L2_CAP_DEVICE_CAPS
-                     ? cap.device_caps : cap.capabilities;
-        if (caps & V4L2_CAP_VIDEO_CAPTURE) {
-            *type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            found = TRUE;
-        } else if (caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
-            *type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            found = TRUE;
-        }
-    }
-    close(fd);
-    return found;
+    for (const gchar *digit = name + 5; *digit != '\0'; digit++)
+        if (!g_ascii_isdigit(*digit))
+            return FALSE;
+    return TRUE;
 }
 
-CaptureDevice *
-capture_device_find_hagibis(GError **error)
+static CaptureVideoNode *
+query_video_node(const gchar *path, const gchar *interface_sysfs)
+{
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        g_warning("Skipping V4L2 node %s: cannot open: %s",
+                  path, g_strerror(errno));
+        return NULL;
+    }
+
+    struct v4l2_capability cap = {0};
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) {
+        g_warning("Skipping V4L2 node %s: VIDIOC_QUERYCAP failed: %s",
+                  path, g_strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+
+    guint32 capabilities = cap.capabilities & V4L2_CAP_DEVICE_CAPS
+        ? cap.device_caps : cap.capabilities;
+    if (!(capabilities & V4L2_CAP_STREAMING) ||
+        (capabilities & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)))
+        return NULL;
+
+    enum v4l2_buf_type buffer_type;
+    if (capabilities & V4L2_CAP_VIDEO_CAPTURE)
+        buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    else if (capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
+        buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    else
+        return NULL;
+
+    CaptureVideoNode *node = g_new0(CaptureVideoNode, 1);
+    node->path = g_strdup(path);
+    node->interface_sysfs = g_strdup(interface_sysfs);
+    node->card_name = g_strndup((const gchar *)cap.card, sizeof(cap.card));
+    node->driver = g_strndup((const gchar *)cap.driver, sizeof(cap.driver));
+    node->bus_info = g_strndup((const gchar *)cap.bus_info, sizeof(cap.bus_info));
+    node->capabilities = capabilities;
+    node->buffer_type = buffer_type;
+    return node;
+}
+
+void
+capture_video_node_free(CaptureVideoNode *node)
+{
+    if (node == NULL)
+        return;
+    g_free(node->path);
+    g_free(node->interface_sysfs);
+    g_free(node->card_name);
+    g_free(node->driver);
+    g_free(node->bus_info);
+    g_free(node);
+}
+
+static CaptureDevice *
+find_device_by_parent(GPtrArray *devices, const gchar *physical_sysfs)
+{
+    for (guint i = 0; i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        if (g_strcmp0(device->physical_sysfs, physical_sysfs) == 0)
+            return device;
+    }
+    return NULL;
+}
+
+static gchar *
+device_display_name_base(const CaptureDevice *device)
+{
+    if (device->manufacturer != NULL && device->product != NULL)
+        return g_strdup_printf("%s %s", device->manufacturer, device->product);
+    if (device->product != NULL)
+        return g_strdup(device->product);
+    if (device->nodes->len != 0) {
+        const CaptureVideoNode *node = g_ptr_array_index(device->nodes, 0);
+        if (node->card_name != NULL && *node->card_name != '\0')
+            return g_strdup(node->card_name);
+    }
+    return g_strdup("Video capture device");
+}
+
+gchar *
+capture_device_stable_id(GPtrArray *devices, const CaptureDevice *device)
+{
+    if (device == NULL)
+        return NULL;
+
+    if (device->usb_sysfs != NULL) {
+        if (device->serial == NULL)
+            return g_strdup_printf("usb:%04x:%04x:sysfs:%s",
+                device->usb_vid, device->usb_pid, device->usb_sysfs);
+
+        gchar *stable_id = g_strdup_printf("usb:%04x:%04x:serial:%s",
+            device->usb_vid, device->usb_pid, device->serial);
+        for (guint i = 0; devices != NULL && i < devices->len; i++) {
+            const CaptureDevice *other = g_ptr_array_index(devices, i);
+            if (other == device || other->usb_sysfs == NULL ||
+                other->serial == NULL || other->usb_vid != device->usb_vid ||
+                other->usb_pid != device->usb_pid ||
+                g_strcmp0(other->serial, device->serial) != 0 ||
+                g_strcmp0(other->usb_sysfs, device->usb_sysfs) == 0)
+                continue;
+            gchar *disambiguated = g_strdup_printf("%s:sysfs:%s",
+                stable_id, device->usb_sysfs);
+            g_free(stable_id);
+            return disambiguated;
+        }
+        return stable_id;
+    }
+
+    const CaptureVideoNode *node = device->nodes != NULL && device->nodes->len != 0
+        ? g_ptr_array_index(device->nodes, 0) : NULL;
+    return g_strdup_printf("sysfs:%s:%s:%s",
+        device->physical_sysfs != NULL ? device->physical_sysfs : "",
+        node != NULL && node->driver != NULL ? node->driver : "",
+        node != NULL && node->bus_info != NULL ? node->bus_info : "");
+}
+
+
+static void
+assign_device_ids_and_names(GPtrArray *devices)
+{
+    GPtrArray *name_bases = g_ptr_array_new_with_free_func(g_free);
+    for (guint i = 0; i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        device->stable_id = capture_device_stable_id(devices, device);
+        g_ptr_array_add(name_bases, device_display_name_base(device));
+    }
+
+    for (guint i = 0; i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        gboolean duplicate_name = FALSE;
+        gboolean duplicate_serial = FALSE;
+        for (guint j = 0; j < devices->len; j++) {
+            CaptureDevice *other = g_ptr_array_index(devices, j);
+            if (i == j ||
+                g_strcmp0(g_ptr_array_index(name_bases, i),
+                          g_ptr_array_index(name_bases, j)) != 0)
+                continue;
+            duplicate_name = TRUE;
+            if (device->serial != NULL && other->serial != NULL &&
+                g_strcmp0(device->serial, other->serial) == 0)
+                duplicate_serial = TRUE;
+        }
+        if (duplicate_name) {
+            const gchar *suffix = device->serial != NULL && !duplicate_serial
+                ? device->serial : device->physical_sysfs;
+            device->display_name = g_strdup_printf("%s (%s)",
+                (const gchar *)g_ptr_array_index(name_bases, i), suffix);
+        } else {
+            device->display_name = g_strdup(g_ptr_array_index(name_bases, i));
+        }
+    }
+    g_ptr_array_unref(name_bases);
+}
+
+
+static gint
+compare_video_nodes_by_path(gconstpointer left_pointer,
+                            gconstpointer right_pointer)
+{
+    const CaptureVideoNode *left = *(CaptureVideoNode * const *)left_pointer;
+    const CaptureVideoNode *right = *(CaptureVideoNode * const *)right_pointer;
+    return g_strcmp0(left->path, right->path);
+}
+
+static gint
+compare_devices(gconstpointer left_pointer, gconstpointer right_pointer)
+{
+    const CaptureDevice *left = *(CaptureDevice * const *)left_pointer;
+    const CaptureDevice *right = *(CaptureDevice * const *)right_pointer;
+    gint by_name = g_strcmp0(left->display_name, right->display_name);
+    return by_name != 0 ? by_name : g_strcmp0(left->stable_id, right->stable_id);
+}
+
+GPtrArray *
+capture_devices_enumerate(GError **error)
 {
     DIR *dir = opendir("/sys/class/video4linux");
     if (dir == NULL) {
@@ -132,72 +285,94 @@ capture_device_find_hagibis(GError **error)
         return NULL;
     }
 
-    CaptureDevice *result = NULL;
+    GPtrArray *devices =
+        g_ptr_array_new_with_free_func((GDestroyNotify)capture_device_free);
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (!g_str_has_prefix(entry->d_name, "video") ||
-            !g_ascii_isdigit(entry->d_name[5]))
+        if (!video_class_entry(entry->d_name))
             continue;
 
-        gchar *class_path = g_build_filename("/sys/class/video4linux", entry->d_name,
-                                             "device", NULL);
+        gchar *class_path = g_build_filename("/sys/class/video4linux",
+                                             entry->d_name, "device", NULL);
         gchar resolved[PATH_MAX];
         if (realpath(class_path, resolved) == NULL) {
+            g_debug("Skipping %s: cannot resolve sysfs device: %s",
+                    entry->d_name, g_strerror(errno));
             g_free(class_path);
             continue;
         }
         g_free(class_path);
 
-        gchar *usb_path = NULL;
+        gchar *dev_path = g_build_filename("/dev", entry->d_name, NULL);
+        CaptureVideoNode *node = query_video_node(dev_path, resolved);
+        g_free(dev_path);
+        if (node == NULL)
+            continue;
+
+        gchar *usb_sysfs = NULL;
         gchar *manufacturer = NULL;
         gchar *product = NULL;
         gchar *serial = NULL;
-        if (!read_usb_ids(resolved, &usb_path, &manufacturer, &product, &serial))
-            continue;
-
-        gchar *dev_path = g_build_filename("/dev", entry->d_name, NULL);
-        enum v4l2_buf_type type;
-        if (!query_capture_type(dev_path, &type)) {
-            g_free(usb_path);
+        guint16 usb_vid = 0;
+        guint16 usb_pid = 0;
+        gboolean is_usb = find_usb_parent(
+            resolved, &usb_sysfs, &usb_vid, &usb_pid,
+            &manufacturer, &product, &serial);
+        const gchar *physical_sysfs = is_usb ? usb_sysfs : resolved;
+        CaptureDevice *device = find_device_by_parent(devices, physical_sysfs);
+        if (device == NULL) {
+            device = g_new0(CaptureDevice, 1);
+            device->physical_sysfs = g_strdup(physical_sysfs);
+            device->usb_sysfs = usb_sysfs;
+            device->usb_vid = usb_vid;
+            device->usb_pid = usb_pid;
+            device->manufacturer = manufacturer;
+            device->product = product;
+            device->serial = serial;
+            device->nodes =
+                g_ptr_array_new_with_free_func((GDestroyNotify)capture_video_node_free);
+            g_ptr_array_add(devices, device);
+        } else {
+            g_free(usb_sysfs);
             g_free(manufacturer);
             g_free(product);
             g_free(serial);
-            g_free(dev_path);
-            continue;
         }
-
-        int fd = open(dev_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        struct v4l2_capability cap = {0};
-        if (fd < 0 || ioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) {
-            if (fd >= 0)
-                close(fd);
-            g_free(usb_path);
-            g_free(manufacturer);
-            g_free(product);
-            g_free(serial);
-            g_free(dev_path);
-            continue;
-        }
-        close(fd);
-
-        result = g_new0(CaptureDevice, 1);
-        result->path = dev_path;
-        result->interface_sysfs = g_strdup(resolved);
-        result->usb_sysfs = usb_path;
-        result->manufacturer = manufacturer;
-        result->product = product;
-        result->serial = serial;
-        result->card_name = g_strdup((const gchar *)cap.card);
-        result->buffer_type = type;
-        break;
+        g_ptr_array_add(device->nodes, node);
     }
     closedir(dir);
 
-    if (result == NULL)
-        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
-                    "Hagibis USB capture device %04x:%04x is not present",
-                    HAGIBIS_VENDOR, HAGIBIS_PRODUCT);
-    return result;
+    for (guint i = 0; i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        g_ptr_array_sort(device->nodes, compare_video_nodes_by_path);
+    }
+    assign_device_ids_and_names(devices);
+    g_ptr_array_sort(devices, compare_devices);
+    return devices;
+}
+
+CaptureDevice *
+capture_device_find_by_id(GPtrArray *devices, const gchar *stable_id)
+{
+    for (guint i = 0; devices != NULL && stable_id != NULL && i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        if (g_strcmp0(device->stable_id, stable_id) == 0)
+            return device;
+    }
+    return NULL;
+}
+
+CaptureDevice *
+capture_device_find_by_physical_path(GPtrArray *devices,
+                                     const gchar *physical_sysfs)
+{
+    for (guint i = 0; devices != NULL && physical_sysfs != NULL &&
+         i < devices->len; i++) {
+        CaptureDevice *device = g_ptr_array_index(devices, i);
+        if (g_strcmp0(device->physical_sysfs, physical_sysfs) == 0)
+            return device;
+    }
+    return NULL;
 }
 
 void
@@ -205,13 +380,15 @@ capture_device_free(CaptureDevice *device)
 {
     if (device == NULL)
         return;
-    g_free(device->path);
-    g_free(device->interface_sysfs);
+    g_free(device->stable_id);
+    g_free(device->display_name);
+    g_free(device->physical_sysfs);
     g_free(device->usb_sysfs);
     g_free(device->manufacturer);
     g_free(device->product);
     g_free(device->serial);
-    g_free(device->card_name);
+    if (device->nodes != NULL)
+        g_ptr_array_unref(device->nodes);
     g_free(device);
 }
 
@@ -416,7 +593,8 @@ enumerate_intervals(int fd, enum v4l2_buf_type type, guint32 fourcc,
     for (guint index = 0; index < 4096; index++) {
         interval.index = index;
         if (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &interval) < 0) {
-            if (errno != EINVAL && !found)
+            if (errno != EINVAL && errno != ENOTTY &&
+                errno != EOPNOTSUPP && errno != ENOSYS && !found)
                 g_warning("VIDIOC_ENUM_FRAMEINTERVALS %ux%u failed: %s",
                           width, height, g_strerror(errno));
             break;
@@ -458,11 +636,11 @@ enumerate_intervals(int fd, enum v4l2_buf_type type, guint32 fourcc,
                 add_interval(modes, fourcc, width, height, compressed, &current);
             }
             if (!exhausted)
-                g_message("Frame interval range for %ux%u exceeds explicit expansion limit; adding valid standard rates",
-                          width, height);
+                g_debug("Frame interval range for %ux%u exceeds explicit expansion limit; adding valid standard rates",
+                        width, height);
         } else {
-            g_message("Continuous frame interval range for %ux%u; adding valid standard rates and endpoints",
-                      width, height);
+            g_debug("Continuous frame interval range for %ux%u; adding valid standard rates and endpoints",
+                    width, height);
         }
 
         static const guint rates[] = {240, 200, 144, 120, 100, 90, 75, 72,
@@ -559,8 +737,8 @@ enumerate_frame_sizes(int fd, enum v4l2_buf_type type, guint32 fourcc,
                 if (inside && aligned)
                     size_add(sizes, w, h);
             }
-            g_message("Frame-size range for FourCC %.4s is represented by endpoints and valid standard sizes",
-                      (const gchar *)&fourcc);
+            g_debug("Frame-size range for FourCC %.4s is represented by endpoints and valid standard sizes",
+                    (const gchar *)&fourcc);
         }
     }
 
@@ -573,30 +751,30 @@ enumerate_frame_sizes(int fd, enum v4l2_buf_type type, guint32 fourcc,
 }
 
 GPtrArray *
-capture_modes_enumerate(const CaptureDevice *device, GError **error)
+capture_modes_enumerate(const CaptureVideoNode *node, GError **error)
 {
-    int fd = open(device->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    int fd = open(node->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
-                    "Cannot open %s: %s", device->path, g_strerror(errno));
+                    "Cannot open %s: %s", node->path, g_strerror(errno));
         return NULL;
     }
 
     GPtrArray *modes = g_ptr_array_new_with_free_func((GDestroyNotify)capture_mode_free);
     struct v4l2_fmtdesc format = {0};
-    format.type = device->buffer_type;
+    format.type = node->buffer_type;
     gboolean found = FALSE;
     for (guint index = 0; index < 256; index++) {
         format.index = index;
         if (ioctl(fd, VIDIOC_ENUM_FMT, &format) < 0) {
             if (errno != EINVAL && !found)
-                g_warning("VIDIOC_ENUM_FMT on %s failed: %s", device->path,
+                g_warning("VIDIOC_ENUM_FMT on %s failed: %s", node->path,
                           g_strerror(errno));
             break;
         }
         found = TRUE;
         gboolean compressed = (format.flags & V4L2_FMT_FLAG_COMPRESSED) != 0;
-        enumerate_frame_sizes(fd, device->buffer_type, format.pixelformat,
+        enumerate_frame_sizes(fd, node->buffer_type, format.pixelformat,
                               compressed, modes);
     }
     close(fd);
@@ -604,7 +782,7 @@ capture_modes_enumerate(const CaptureDevice *device, GError **error)
     if (modes->len == 0) {
         g_ptr_array_unref(modes);
         g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
-                    "No usable V4L2 capture modes were enumerated from %s", device->path);
+                    "No usable V4L2 capture modes were enumerated from %s", node->path);
         return NULL;
     }
     g_ptr_array_sort(modes, compare_modes);

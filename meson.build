@@ -18,7 +18,7 @@ foreach warning : ['-Wformat=2', '-Wshadow', '-Wstrict-prototypes']
   endif
 endforeach
 
-gtk = dependency('gtk+-3.0', required: true)
+gtk = dependency('gtk+-3.0', version: '>=3.22', required: true)
 glib = dependency('glib-2.0', version: '>=2.74', required: true)
 
 gst = dependency('gstreamer-1.0', required: true)
@@ -43,6 +43,14 @@ renderer_layout_test = executable(
   c_args: cc_args,
 )
 test('renderer-layout', renderer_layout_test)
+
+capture_identity_test = executable(
+  'test-capture-identity',
+  ['tests/test_capture_identity.c', 'src/capture.c'],
+  dependencies: [glib],
+  c_args: cc_args,
+)
+test('capture-identity', capture_identity_test)
 
 install_data(
   'data/io.github.wully616.captureviewer.desktop',
