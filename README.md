@@ -1,6 +1,6 @@
 # CaptureViewer
 
-CaptureViewer is a low-latency Linux viewer for USB video capture devices. It uses V4L2 for capture, GStreamer for video and audio, and GTK 3 for the interface. It provides fullscreen and windowed viewing, capture-mode selection, scaling controls, audio selection, and capture statistics.
+CaptureViewer is a low-latency Linux viewer for USB video capture devices. It uses V4L2 for capture, GStreamer for video and audio, and GTK 3 for the interface. Its video-first interface reveals a VR-friendly control bar from the top edge, with device-dependent format, resolution, and frame-rate selection that can be pinned open. It also provides fullscreen and windowed viewing, scaling controls, audio selection, and capture statistics.
 
 ## Tested hardware
 

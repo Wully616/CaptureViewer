@@ -31,7 +31,7 @@ capture_preferences_new(void)
     preferences->values.audio_enabled = TRUE;
     preferences->values.audio_selection_id = g_strdup("auto");
     preferences->values.volume = 0.8;
-    preferences->values.panel_dwell_ms = 150;
+    preferences->values.panel_dwell_ms = 350;
     preferences->values.panel_hide_delay_ms = 700;
     preferences->values.scale_mode = CAPTURE_PREFERENCES_SCALE_FIT;
     preferences->mode_preferences =
@@ -135,7 +135,7 @@ capture_preferences_new(void)
                 g_key_file_get_boolean(key_file, "ui", "stats-visible", NULL);
         if (g_key_file_has_key(key_file, "ui", "dwell-ms", NULL)) {
             gint dwell = g_key_file_get_integer(key_file, "ui", "dwell-ms", NULL);
-            if (dwell >= 100 && dwell <= 250)
+            if (dwell >= 300 && dwell <= 500)
                 preferences->values.panel_dwell_ms = (guint)dwell;
         }
         if (g_key_file_has_key(key_file, "ui", "hide-delay-ms", NULL)) {
