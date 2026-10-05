@@ -1199,6 +1199,47 @@ selected_decoder_description(const CaptureMode *mode)
     return is_mjpeg_mode(mode) ? "jpegdec" : "decodebin (dynamic selection)";
 }
 
+static void
+append_renderer_timing_summary(GString *text, const gchar *name,
+                               const CaptureRendererTimingSummary *summary)
+{
+    g_string_append_printf(text, "%s ", name);
+    if (summary->sample_count == 0) {
+        g_string_append(text, "n/a");
+        return;
+    }
+    g_string_append_printf(text, "%.3f/%.3f/%.3f ms (n=%u)",
+                           summary->average_ms, summary->p50_ms,
+                           summary->p95_ms, summary->sample_count);
+}
+
+static gchar *
+format_renderer_timing_stats(const CaptureRendererTimingStats *stats)
+{
+    GString *text = g_string_new(
+        "Software-only timing; source-pad buffer arrival → OpenGL render "
+        "callback entry; PTS is frame identity only; avg/p50/p95 "
+        "(rolling 256 samples):\n");
+    append_renderer_timing_summary(text, "Source→decoded",
+                                   &stats->source_to_decoded);
+    g_string_append(text, " · ");
+    append_renderer_timing_summary(text, "Decoded→appsink",
+                                   &stats->decoded_to_appsink);
+    g_string_append_c(text, '\n');
+    append_renderer_timing_summary(text, "Appsink→dispatch",
+                                   &stats->appsink_to_dispatch);
+    g_string_append(text, " · ");
+    append_renderer_timing_summary(text, "Dispatch→GL",
+                                   &stats->dispatch_to_gl);
+    g_string_append_c(text, '\n');
+    append_renderer_timing_summary(text, "Appsink→GL",
+                                   &stats->appsink_to_gl);
+    g_string_append(text, " · ");
+    append_renderer_timing_summary(text, "Source→GL",
+                                   &stats->source_to_gl);
+    return g_string_free(text, FALSE);
+}
+
 void
 capture_ui_update(CaptureUi *ui, const CaptureUiModel *model)
 {
@@ -1349,19 +1390,12 @@ capture_ui_update(CaptureUi *ui, const CaptureUiModel *model)
 
     gchar *overlay_text = NULL;
     gchar *perf = NULL;
-    gchar *latency_text = NULL;
+    gchar *latency_text =
+        format_renderer_timing_stats(&model->renderer_timing_stats);
     gchar *audio_stats = NULL;
     if (show_diagnostics) {
-        latency_text = stats.latency_min_ns >= 0
-            ? (stats.latency_max_ns >= 0
-                ? g_strdup_printf("Pipeline-reported latency %.1f–%.1f ms (not end-to-end)",
-                    stats.latency_min_ns / 1000000.0,
-                    stats.latency_max_ns / 1000000.0)
-                : g_strdup_printf("Pipeline-reported latency ≥ %.1f ms (not end-to-end)",
-                    stats.latency_min_ns / 1000000.0))
-            : g_strdup("Pipeline-reported latency unavailable (not end-to-end)");
         perf = g_strdup_printf("FPS %.1f avg %.1f · dropped %" G_GUINT64_FORMAT
-            " · queue %" G_GUINT64_FORMAT " · CPU %.1f%% · %s",
+            " · queue %" G_GUINT64_FORMAT " · CPU %.1f%%\n%s",
             stats.current_fps, stats.average_fps, stats.frames_dropped,
             stats.queue_level, stats.cpu_percent, latency_text);
         audio_stats = model->audio.source != NULL && preferences->audio_enabled &&
@@ -1444,20 +1478,11 @@ capture_ui_update(CaptureUi *ui, const CaptureUiModel *model)
     }
 
     if (ui->stats_overlay_label != NULL) {
-        gchar *overlay_latency = stats.latency_min_ns >= 0
-            ? (stats.latency_max_ns >= 0
-                ? g_strdup_printf("Pipeline-reported latency %.0f–%.0f ms (not end-to-end)",
-                    stats.latency_min_ns / 1000000.0,
-                    stats.latency_max_ns / 1000000.0)
-                : g_strdup_printf("Pipeline-reported latency ≥ %.0f ms (not end-to-end)",
-                    stats.latency_min_ns / 1000000.0))
-            : g_strdup("Pipeline-reported latency unavailable");
         overlay_text = g_strdup_printf(
             "%s\nFPS %.1f avg %.1f · dropped %" G_GUINT64_FORMAT
-            " · CPU %.1f%% · %s",
+            " · CPU %.1f%%\n%s",
             mode_name, stats.current_fps, stats.average_fps,
-            stats.frames_dropped, stats.cpu_percent, overlay_latency);
-        g_free(overlay_latency);
+            stats.frames_dropped, stats.cpu_percent, latency_text);
         gtk_label_set_text(GTK_LABEL(ui->stats_overlay_label), overlay_text);
     }
 

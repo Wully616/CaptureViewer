@@ -15,8 +15,6 @@ typedef struct {
     gdouble cpu_percent;
     gint64 audio_source_latency_us;
     gint64 audio_source_buffer_us;
-    gint64 latency_min_ns;
-    gint64 latency_max_ns;
 } CapturePipelineStats;
 
 typedef struct {

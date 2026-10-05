@@ -54,6 +54,7 @@ typedef struct {
     CaptureAudioState audio;
     CapturePipeline *pipeline;
     CapturePipelineStats pipeline_stats;
+    CaptureRendererTimingStats renderer_timing_stats;
     const gchar *pipeline_error;
     const gchar *log_path;
     const gchar *renderer_backend;

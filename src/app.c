@@ -1297,6 +1297,8 @@ app_refresh_ui(AppState *app)
         .audio = capture_audio_get_state(app->audio),
         .pipeline = app->pipeline,
         .pipeline_stats = app->pipeline_stats,
+        .renderer_timing_stats =
+            capture_renderer_get_timing_stats(app->renderer),
         .pipeline_error = pipeline_error,
         .log_path = app->log_path,
         .renderer_backend = capture_renderer_get_backend_name(app->renderer),

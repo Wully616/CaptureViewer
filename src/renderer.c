@@ -4,6 +4,54 @@
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TIMING_SAMPLE_WINDOW 256
+#define SOURCE_TIMING_SLOTS 64
+
+typedef enum {
+    TIMING_SOURCE_TO_DECODED,
+    TIMING_DECODED_TO_APPSINK,
+    TIMING_APPSINK_TO_DISPATCH,
+    TIMING_DISPATCH_TO_GL,
+    TIMING_APPSINK_TO_GL,
+    TIMING_SOURCE_TO_GL,
+    TIMING_METRIC_COUNT,
+} TimingMetric;
+
+enum {
+    FRAME_TIMING_SOURCE = 1u << 0,
+    FRAME_TIMING_DECODED = 1u << 1,
+    FRAME_TIMING_APPSINK = 1u << 2,
+    FRAME_TIMING_DISPATCH = 1u << 3,
+    FRAME_TIMING_GL = 1u << 4,
+};
+
+typedef struct {
+    gboolean valid;
+    gboolean ambiguous;
+    gboolean decoded;
+    GstClockTime pts;
+    gint64 source_us;
+    gint64 decoded_us;
+} SourceFrameTiming;
+
+typedef struct {
+    guint valid_mask;
+    gint64 source_us;
+    gint64 decoded_us;
+    gint64 appsink_us;
+    gint64 dispatch_us;
+    gint64 gl_us;
+} FrameTiming;
+
+typedef struct {
+    gint64 samples_us[TIMING_SAMPLE_WINDOW];
+    guint sample_count;
+    guint next_sample;
+    gint64 sum_us;
+} TimingMetricSamples;
 
 struct _CaptureRenderer {
     gint ref_count;
@@ -14,10 +62,13 @@ struct _CaptureRenderer {
     gulong cairo_motion_handler_id;
     GMainContext *main_context;
     GMutex sample_mutex;
+    GMutex timing_mutex;
     GstSample *latest_sample;
+    FrameTiming latest_frame_timing;
     GstElement *sink;
     gchar *backend_name;
     guint64 sample_generation;
+    guint64 last_timed_generation;
     guint64 uploaded_generation;
     guint source_width;
     guint source_height;
@@ -45,10 +96,24 @@ struct _CaptureRenderer {
     gboolean dispatch_pending;
     gboolean closing;
     gboolean gl_initialized;
+    SourceFrameTiming source_timing[SOURCE_TIMING_SLOTS];
+    guint source_timing_next;
+    TimingMetricSamples timing_metrics[TIMING_METRIC_COUNT];
 };
 
 static CaptureRenderer *capture_renderer_ref(CaptureRenderer *renderer);
 static void capture_renderer_unref(CaptureRenderer *renderer);
+static gboolean timing_delta_us(guint valid_mask, guint start_flag,
+                                gint64 start_us, guint end_flag,
+                                gint64 end_us, gint64 *duration_us);
+static void timing_metric_add_locked(CaptureRenderer *renderer,
+                                     TimingMetric metric, gint64 duration_us);
+static void record_frame_timing(CaptureRenderer *renderer,
+                                const FrameTiming *timing);
+static FrameTiming frame_timing_at_appsink(CaptureRenderer *renderer,
+                                           GstBuffer *buffer,
+                                           gint64 appsink_us);
+static void reset_renderer_timing(CaptureRenderer *renderer);
 
 static GLuint
 compile_shader(GLenum type, const gchar *source, GError **error)
@@ -335,12 +400,15 @@ capture_renderer_compute_layout(guint source_width,
 }
 
 static GstSample *
-get_latest_sample(CaptureRenderer *renderer, guint64 *generation)
+get_latest_sample(CaptureRenderer *renderer, guint64 *generation,
+                  FrameTiming *timing)
 {
     g_mutex_lock(&renderer->sample_mutex);
     GstSample *sample = renderer->latest_sample != NULL
         ? gst_sample_ref(renderer->latest_sample) : NULL;
     *generation = renderer->sample_generation;
+    if (timing != NULL)
+        *timing = renderer->latest_frame_timing;
     g_mutex_unlock(&renderer->sample_mutex);
     return sample;
 }
@@ -431,6 +499,7 @@ static gboolean
 on_gl_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
 {
     CaptureRenderer *renderer = user_data;
+    gint64 render_callback_us = g_get_monotonic_time();
     gint allocated_width = gtk_widget_get_allocated_width(GTK_WIDGET(area));
     gint allocated_height = gtk_widget_get_allocated_height(GTK_WIDGET(area));
     gint scale = gtk_widget_get_scale_factor(GTK_WIDGET(area));
@@ -453,9 +522,20 @@ on_gl_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     glClear(GL_COLOR_BUFFER_BIT);
 
     guint64 generation = 0;
-    GstSample *sample = get_latest_sample(renderer, &generation);
+    FrameTiming frame_timing = {0};
+    GstSample *sample = get_latest_sample(renderer, &generation,
+                                          &frame_timing);
     if (sample == NULL)
         return TRUE;
+    if (generation != renderer->last_timed_generation) {
+        renderer->last_timed_generation = generation;
+        if ((frame_timing.valid_mask & FRAME_TIMING_APPSINK) != 0 &&
+            render_callback_us >= frame_timing.appsink_us) {
+            frame_timing.gl_us = render_callback_us;
+            frame_timing.valid_mask |= FRAME_TIMING_GL;
+            record_frame_timing(renderer, &frame_timing);
+        }
+    }
 
     GstVideoInfo info;
     GstVideoFrame frame;
@@ -590,7 +670,7 @@ on_cairo_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
         return TRUE;
 
     guint64 generation = 0;
-    GstSample *sample = get_latest_sample(renderer, &generation);
+    GstSample *sample = get_latest_sample(renderer, &generation, NULL);
     if (sample == NULL)
         return TRUE;
 
@@ -644,6 +724,14 @@ renderer_dispatch(gpointer user_data)
     g_mutex_lock(&renderer->sample_mutex);
     renderer->dispatch_pending = FALSE;
     gboolean closing = renderer->closing;
+    if (!closing && renderer->latest_sample != NULL &&
+        (renderer->latest_frame_timing.valid_mask & FRAME_TIMING_APPSINK) != 0) {
+        gint64 dispatch_us = g_get_monotonic_time();
+        if (dispatch_us >= renderer->latest_frame_timing.appsink_us) {
+            renderer->latest_frame_timing.dispatch_us = dispatch_us;
+            renderer->latest_frame_timing.valid_mask |= FRAME_TIMING_DISPATCH;
+        }
+    }
     g_mutex_unlock(&renderer->sample_mutex);
     if (!closing) {
         gtk_gl_area_queue_render(GTK_GL_AREA(renderer->gl_area));
@@ -660,6 +748,7 @@ on_new_sample(GstAppSink *sink, gpointer user_data)
     GstSample *sample = gst_app_sink_pull_sample(sink);
     if (sample == NULL)
         return GST_FLOW_EOS;
+    gint64 appsink_us = g_get_monotonic_time();
 
     GstVideoInfo info;
     gboolean valid_caps = gst_sample_get_caps(sample) != NULL &&
@@ -669,6 +758,10 @@ on_new_sample(GstAppSink *sink, gpointer user_data)
         valid_caps = format == GST_VIDEO_FORMAT_RGBA ||
                      format == GST_VIDEO_FORMAT_I420;
     }
+    FrameTiming sample_timing = {0};
+    if (valid_caps)
+        sample_timing = frame_timing_at_appsink(
+            renderer, gst_sample_get_buffer(sample), appsink_us);
     GstSample *old_sample = NULL;
     gboolean schedule_dispatch = FALSE;
     g_mutex_lock(&renderer->sample_mutex);
@@ -689,6 +782,7 @@ on_new_sample(GstAppSink *sink, gpointer user_data)
     }
     old_sample = renderer->latest_sample;
     renderer->latest_sample = sample;
+    renderer->latest_frame_timing = sample_timing;
     renderer->sample_generation++;
     if (!renderer->dispatch_pending) {
         renderer->dispatch_pending = TRUE;
@@ -726,6 +820,7 @@ capture_renderer_unref(CaptureRenderer *renderer)
         g_main_context_unref(renderer->main_context);
     g_free(renderer->backend_name);
     g_mutex_clear(&renderer->sample_mutex);
+    g_mutex_clear(&renderer->timing_mutex);
     g_free(renderer);
 }
 
@@ -736,6 +831,7 @@ capture_renderer_new(GError **error)
     renderer->ref_count = 1;
     renderer->main_context = g_main_context_ref_thread_default();
     g_mutex_init(&renderer->sample_mutex);
+    g_mutex_init(&renderer->timing_mutex);
     renderer->scale_mode = CAPTURE_RENDERER_FIT;
     renderer->pixel_aspect_num = 1;
     renderer->pixel_aspect_den = 1;
@@ -870,10 +966,13 @@ capture_renderer_pipeline_stopped(CaptureRenderer *renderer)
     renderer->source_height = 0;
     renderer->pixel_aspect_num = 1;
     renderer->pixel_aspect_den = 1;
+    renderer->latest_frame_timing = (FrameTiming){0};
     renderer->sample_generation++;
+    renderer->last_timed_generation = renderer->sample_generation;
     g_mutex_unlock(&renderer->sample_mutex);
     if (sample != NULL)
         gst_sample_unref(sample);
+    reset_renderer_timing(renderer);
     gtk_gl_area_queue_render(GTK_GL_AREA(renderer->gl_area));
     gtk_widget_queue_draw(renderer->cairo_area);
 }
@@ -905,4 +1004,235 @@ capture_renderer_free(CaptureRenderer *renderer)
     if (renderer->gl_initialized && gtk_widget_get_realized(renderer->gl_area))
         on_gl_unrealize(GTK_GL_AREA(renderer->gl_area), renderer);
     capture_renderer_unref(renderer);
+}
+
+static void
+reset_renderer_timing(CaptureRenderer *renderer)
+{
+    g_mutex_lock(&renderer->timing_mutex);
+    memset(renderer->source_timing, 0, sizeof(renderer->source_timing));
+    memset(renderer->timing_metrics, 0, sizeof(renderer->timing_metrics));
+    renderer->source_timing_next = 0;
+    g_mutex_unlock(&renderer->timing_mutex);
+}
+
+static gboolean
+timing_delta_us(guint valid_mask, guint start_flag, gint64 start_us,
+                guint end_flag, gint64 end_us, gint64 *duration_us)
+{
+    if ((valid_mask & start_flag) == 0 || (valid_mask & end_flag) == 0 ||
+        end_us < start_us)
+        return FALSE;
+    *duration_us = end_us - start_us;
+    return TRUE;
+}
+
+static void
+timing_metric_add_locked(CaptureRenderer *renderer, TimingMetric metric,
+                         gint64 duration_us)
+{
+    TimingMetricSamples *samples = &renderer->timing_metrics[metric];
+    if (samples->sample_count == TIMING_SAMPLE_WINDOW)
+        samples->sum_us -= samples->samples_us[samples->next_sample];
+    else
+        samples->sample_count++;
+    samples->samples_us[samples->next_sample] = duration_us;
+    samples->sum_us += duration_us;
+    samples->next_sample = (samples->next_sample + 1) % TIMING_SAMPLE_WINDOW;
+}
+
+static void
+record_frame_timing(CaptureRenderer *renderer, const FrameTiming *timing)
+{
+    gint64 duration_us;
+    g_mutex_lock(&renderer->timing_mutex);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_SOURCE,
+                        timing->source_us, FRAME_TIMING_DECODED,
+                        timing->decoded_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_SOURCE_TO_DECODED,
+                                 duration_us);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_DECODED,
+                        timing->decoded_us, FRAME_TIMING_APPSINK,
+                        timing->appsink_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_DECODED_TO_APPSINK,
+                                 duration_us);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_APPSINK,
+                        timing->appsink_us, FRAME_TIMING_DISPATCH,
+                        timing->dispatch_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_APPSINK_TO_DISPATCH,
+                                 duration_us);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_DISPATCH,
+                        timing->dispatch_us, FRAME_TIMING_GL,
+                        timing->gl_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_DISPATCH_TO_GL, duration_us);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_APPSINK,
+                        timing->appsink_us, FRAME_TIMING_GL,
+                        timing->gl_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_APPSINK_TO_GL, duration_us);
+    if (timing_delta_us(timing->valid_mask, FRAME_TIMING_SOURCE,
+                        timing->source_us, FRAME_TIMING_GL,
+                        timing->gl_us, &duration_us))
+        timing_metric_add_locked(renderer, TIMING_SOURCE_TO_GL, duration_us);
+    g_mutex_unlock(&renderer->timing_mutex);
+}
+
+static FrameTiming
+frame_timing_at_appsink(CaptureRenderer *renderer, GstBuffer *buffer,
+                        gint64 appsink_us)
+{
+    FrameTiming timing = {
+        .valid_mask = FRAME_TIMING_APPSINK,
+        .appsink_us = appsink_us,
+    };
+    if (buffer == NULL)
+        return timing;
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+    if (!GST_CLOCK_TIME_IS_VALID(pts))
+        return timing;
+
+    g_mutex_lock(&renderer->timing_mutex);
+    SourceFrameTiming *match = NULL;
+    guint matches = 0;
+    for (guint i = 0; i < SOURCE_TIMING_SLOTS; i++) {
+        SourceFrameTiming *candidate = &renderer->source_timing[i];
+        if (candidate->valid && candidate->pts == pts) {
+            match = candidate;
+            matches++;
+        }
+    }
+    if (matches == 1 && !match->ambiguous && match->decoded &&
+        match->source_us <= match->decoded_us &&
+        match->decoded_us <= appsink_us) {
+        timing.source_us = match->source_us;
+        timing.decoded_us = match->decoded_us;
+        timing.valid_mask |= FRAME_TIMING_SOURCE | FRAME_TIMING_DECODED;
+        match->valid = FALSE;
+    }
+    g_mutex_unlock(&renderer->timing_mutex);
+    return timing;
+}
+
+void
+capture_renderer_record_source_buffer(CaptureRenderer *renderer,
+                                      GstBuffer *buffer)
+{
+    if (renderer == NULL || buffer == NULL)
+        return;
+    gint64 source_us = g_get_monotonic_time();
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+
+    g_mutex_lock(&renderer->timing_mutex);
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT))
+        memset(renderer->source_timing, 0, sizeof(renderer->source_timing));
+    if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+        g_mutex_unlock(&renderer->timing_mutex);
+        return;
+    }
+    gboolean ambiguous = FALSE;
+    for (guint i = 0; i < SOURCE_TIMING_SLOTS; i++) {
+        SourceFrameTiming *candidate = &renderer->source_timing[i];
+        if (candidate->valid && candidate->pts == pts) {
+            candidate->ambiguous = TRUE;
+            ambiguous = TRUE;
+        }
+    }
+    SourceFrameTiming *entry =
+        &renderer->source_timing[renderer->source_timing_next];
+    renderer->source_timing_next =
+        (renderer->source_timing_next + 1) % SOURCE_TIMING_SLOTS;
+    *entry = (SourceFrameTiming){
+        .valid = TRUE,
+        .ambiguous = ambiguous,
+        .pts = pts,
+        .source_us = source_us,
+    };
+    g_mutex_unlock(&renderer->timing_mutex);
+}
+
+void
+capture_renderer_record_decoded_buffer(CaptureRenderer *renderer,
+                                       GstBuffer *buffer)
+{
+    if (renderer == NULL || buffer == NULL)
+        return;
+    gint64 decoded_us = g_get_monotonic_time();
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+    if (!GST_CLOCK_TIME_IS_VALID(pts))
+        return;
+
+    g_mutex_lock(&renderer->timing_mutex);
+    SourceFrameTiming *match = NULL;
+    guint matches = 0;
+    for (guint i = 0; i < SOURCE_TIMING_SLOTS; i++) {
+        SourceFrameTiming *candidate = &renderer->source_timing[i];
+        if (candidate->valid && candidate->pts == pts) {
+            match = candidate;
+            matches++;
+        }
+    }
+    if (matches == 1 && !match->ambiguous && !match->decoded) {
+        match->decoded_us = decoded_us;
+        match->decoded = TRUE;
+    } else if (matches > 1) {
+        for (guint i = 0; i < SOURCE_TIMING_SLOTS; i++) {
+            SourceFrameTiming *candidate = &renderer->source_timing[i];
+            if (candidate->valid && candidate->pts == pts)
+                candidate->ambiguous = TRUE;
+        }
+    }
+    g_mutex_unlock(&renderer->timing_mutex);
+}
+
+static gint
+compare_timing_sample(const void *first, const void *second)
+{
+    gint64 left = *(const gint64 *)first;
+    gint64 right = *(const gint64 *)second;
+    return (left > right) - (left < right);
+}
+
+CaptureRendererTimingStats
+capture_renderer_get_timing_stats(CaptureRenderer *renderer)
+{
+    CaptureRendererTimingStats result = {0};
+    if (renderer == NULL)
+        return result;
+
+    gint64 ordered[TIMING_METRIC_COUNT][TIMING_SAMPLE_WINDOW];
+    guint sample_counts[TIMING_METRIC_COUNT];
+    gint64 sums_us[TIMING_METRIC_COUNT];
+    CaptureRendererTimingSummary *summaries[TIMING_METRIC_COUNT] = {
+        &result.source_to_decoded,
+        &result.decoded_to_appsink,
+        &result.appsink_to_dispatch,
+        &result.dispatch_to_gl,
+        &result.appsink_to_gl,
+        &result.source_to_gl,
+    };
+
+    g_mutex_lock(&renderer->timing_mutex);
+    for (guint i = 0; i < TIMING_METRIC_COUNT; i++) {
+        const TimingMetricSamples *samples = &renderer->timing_metrics[i];
+        sample_counts[i] = samples->sample_count;
+        sums_us[i] = samples->sum_us;
+        if (sample_counts[i] > 0)
+            memcpy(ordered[i], samples->samples_us,
+                   sample_counts[i] * sizeof(ordered[i][0]));
+    }
+    g_mutex_unlock(&renderer->timing_mutex);
+
+    for (guint i = 0; i < TIMING_METRIC_COUNT; i++) {
+        guint count = sample_counts[i];
+        if (count == 0)
+            continue;
+        qsort(ordered[i], count, sizeof(ordered[i][0]),
+              compare_timing_sample);
+        guint p50_rank = (count * 50 + 99) / 100;
+        guint p95_rank = (count * 95 + 99) / 100;
+        summaries[i]->sample_count = count;
+        summaries[i]->average_ms = (gdouble)sums_us[i] / count / 1000.0;
+        summaries[i]->p50_ms = (gdouble)ordered[i][p50_rank - 1] / 1000.0;
+        summaries[i]->p95_ms = (gdouble)ordered[i][p95_rank - 1] / 1000.0;
+    }
+    return result;
 }

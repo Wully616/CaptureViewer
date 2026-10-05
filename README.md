@@ -15,14 +15,19 @@ The module is installed outside the app so it remains available across app resta
 
 ## Performance
 
-On Steam Frame with the Hagibis UHC07, the highest validated capture mode is MJPEG 1280×720 at 60 fps: about 60 fps live, 57.6 fps startup average, and zero pipeline-reported dropped frames. MJPEG 1920×1080 at 50 fps reached about 49.9 fps with zero reported drops. These are observed results, not performance guarantees; pipeline statistics do not measure end-to-end display latency.
+On Steam Frame with the Hagibis UHC07, the highest validated capture mode is MJPEG 1280×720 at 60 fps: about 60 fps live, 57.6 fps startup average, and zero pipeline-reported dropped frames. MJPEG 1920×1080 at 50 fps reached about 49.9 fps with zero reported drops. These are observed results, not performance guarantees.
+
+The diagnostics pane reports mean, p50, and p95 over the rolling 256 samples for each software timing stage: GStreamer source-pad buffer arrival → decoded buffer, decoded buffer → appsink pull, appsink pull → renderer-dispatch callback, and renderer dispatch → OpenGL render-callback entry. It also reports appsink → OpenGL and source → OpenGL totals. PTS is used only to correlate callbacks with a frame; elapsed time uses the monotonic clock.
+
+These are not end-to-end capture-to-display measurements. They exclude camera/HDMI and USB/kernel delay before the source pad, GPU execution/completion, vsync/compositor, and physical display presentation. The OpenGL timestamp is callback entry, not completed rendering; OpenGL timings are unavailable in the Cairo fallback.
 
 ## Build and install on SteamOS
 
 Build requirements: a C compiler, Meson 0.60 or newer, Ninja, pkg-config, GTK 3, GLib 2.74 or newer, GStreamer core/video/audio/app development libraries, libepoxy, GNU tar, and zstd. Run these commands from the repository root to build a user-installable archive and install it without system-wide package installation:
 
 ```sh
-tmp=$(mktemp -d /tmp/captureviewer-uvc-test.XXXXXX)
+set -euo pipefail
+tmp=$(mktemp -d /tmp/captureviewer-update.XXXXXX)
 
 meson setup "$tmp/build" \
   --prefix=/captureviewer/app \

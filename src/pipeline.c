@@ -318,6 +318,30 @@ on_video_frame_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
     return GST_PAD_PROBE_OK;
 }
 
+
+static GstPadProbeReturn
+on_capture_source_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        CapturePipeline *pipeline = user_data;
+        GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        capture_renderer_record_source_buffer(pipeline->renderer, buffer);
+    }
+    (void)pad;
+    return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+on_decoded_video_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        CapturePipeline *pipeline = user_data;
+        GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        capture_renderer_record_decoded_buffer(pipeline->renderer, buffer);
+    }
+    (void)pad;
+    return GST_PAD_PROBE_OK;
+}
 static gboolean
 setup_video_branch(CapturePipeline *pipeline, const CaptureVideoNode *node,
                    const CaptureMode *mode, GError **error)
@@ -413,6 +437,18 @@ setup_video_branch(CapturePipeline *pipeline, const CaptureVideoNode *node,
         g_set_error(error, GST_CORE_ERROR, GST_CORE_ERROR_NEGOTIATION,
                     "Could not link video elements for %s", mode->label);
         return FALSE;
+    }
+    GstPad *source_pad = gst_element_get_static_pad(source, "src");
+    if (source_pad != NULL) {
+        gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                          on_capture_source_buffer, pipeline, NULL);
+        gst_object_unref(source_pad);
+    }
+    GstPad *decoded_pad = gst_element_get_static_pad(convert, "sink");
+    if (decoded_pad != NULL) {
+        gst_pad_add_probe(decoded_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                          on_decoded_video_buffer, pipeline, NULL);
+        gst_object_unref(decoded_pad);
     }
     GstPad *frame_pad = gst_element_get_static_pad(convert, "src");
     if (frame_pad != NULL) {
@@ -523,8 +559,6 @@ pipeline_stop(CapturePipeline *pipeline)
     pipeline->last_video_frame_us = 0;
     pipeline->stats.audio_source_latency_us = -1;
     pipeline->stats.audio_source_buffer_us = -1;
-    pipeline->stats.latency_min_ns = -1;
-    pipeline->stats.latency_max_ns = -1;
     g_mutex_unlock(&pipeline->stats_mutex);
 }
 
@@ -542,8 +576,6 @@ capture_pipeline_new(CaptureRenderer *renderer,
     pipeline->user_data = user_data;
     pipeline->stats.audio_source_latency_us = -1;
     pipeline->stats.audio_source_buffer_us = -1;
-    pipeline->stats.latency_min_ns = -1;
-    pipeline->stats.latency_max_ns = -1;
     g_mutex_init(&pipeline->stats_mutex);
     return pipeline;
 }
@@ -713,17 +745,6 @@ capture_pipeline_update_stats(CapturePipeline *pipeline)
         g_object_get(pipeline->audio_source, "actual-latency-time", &source_latency,
                      "actual-buffer-time", &source_buffer, NULL);
     }
-    GstQuery *query = gst_query_new_latency();
-    gint64 min_latency = -1, max_latency = -1;
-    gboolean live = FALSE;
-    if (gst_element_query(pipeline->pipeline, query)) {
-        GstClockTime min = GST_CLOCK_TIME_NONE, max = GST_CLOCK_TIME_NONE;
-        gst_query_parse_latency(query, &live, &min, &max);
-        min_latency = GST_CLOCK_TIME_IS_VALID(min) ? (gint64)min : -1;
-        max_latency = GST_CLOCK_TIME_IS_VALID(max) ? (gint64)max : -1;
-    }
-    gst_query_unref(query);
-
     gint64 cpu_time = process_cpu_time_us();
     gint64 wall_time = g_get_monotonic_time();
     g_mutex_lock(&pipeline->stats_mutex);
@@ -738,8 +759,6 @@ capture_pipeline_update_stats(CapturePipeline *pipeline)
     pipeline->stats.queue_level = queued;
     pipeline->stats.audio_source_latency_us = source_latency;
     pipeline->stats.audio_source_buffer_us = source_buffer;
-    pipeline->stats.latency_min_ns = min_latency;
-    pipeline->stats.latency_max_ns = max_latency;
     g_mutex_unlock(&pipeline->stats_mutex);
 }
 
