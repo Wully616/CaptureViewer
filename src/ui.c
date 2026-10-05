@@ -9,6 +9,7 @@ struct _CaptureUi {
     GtkWidget *root_overlay;
     GtkWidget *settings;
     GtkWidget *control_panel;
+    GtkCssProvider *control_css;
     GtkWidget *control_revealer;
     GtkWidget *edge_hint;
     GtkWidget *stats_overlay_label;
@@ -745,8 +746,8 @@ create_control_panel(CaptureUi *ui, const CapturePreferencesValues *preferences)
     gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(controls), 8);
     gtk_widget_set_hexpand(controls, TRUE);
     gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, TRUE, 0);
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(css,
+    ui->control_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(ui->control_css,
         "#capture-control-panel { background-color: rgba(11, 15, 20, 0.94); "
         "border: 1px solid rgba(96, 165, 250, 0.30); border-radius: 16px; } "
         "#capture-control-panel label { color: #F1F5F9; } "
@@ -762,11 +763,9 @@ create_control_panel(CaptureUi *ui, const CapturePreferencesValues *preferences)
         "#capture-edge-hint { background-color: rgba(148, 163, 184, 0.38); border-radius: 4px; } "
         "#capture-edge-hint:hover, #capture-edge-hint.active { background-color: #33C3FF; "
         "box-shadow: 0 0 8px rgba(51, 195, 255, 0.70); }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(panel),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(ui->edge_hint),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(css);
+    gtk_style_context_add_provider_for_screen(
+        gtk_widget_get_screen(ui->window), GTK_STYLE_PROVIDER(ui->control_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     GtkWidget *brand = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -1044,6 +1043,12 @@ capture_ui_free(CaptureUi *ui)
         g_source_remove(ui->dwell_watch_id);
     if (ui->panel_hide_watch_id != 0)
         g_source_remove(ui->panel_hide_watch_id);
+    if (ui->control_css != NULL) {
+        gtk_style_context_remove_provider_for_screen(
+            gtk_widget_get_screen(ui->window),
+            GTK_STYLE_PROVIDER(ui->control_css));
+        g_object_unref(ui->control_css);
+    }
     gtk_widget_destroy(ui->window);
     ui->window = NULL;
     g_free(ui);
