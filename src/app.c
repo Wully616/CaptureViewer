@@ -6,12 +6,16 @@
 #include "preferences.h"
 #include "renderer.h"
 #include "ui.h"
+#include "uvc_setup.h"
 #include <gtk/gtk.h>
 #include <gst/gst.h>
 #include <linux/videodev2.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
 
 
 #define DEVICE_RESCAN_MS 1000
@@ -20,6 +24,19 @@
 #define MODE_DEFAULT_FPS 60
 
 typedef CaptureViewerApp AppState;
+typedef enum {
+    UVC_SETUP_OPERATION_INSTALL,
+    UVC_SETUP_OPERATION_REPAIR,
+    UVC_SETUP_OPERATION_LOAD,
+    UVC_SETUP_OPERATION_UNINSTALL,
+} UvcSetupOperationKind;
+
+typedef struct {
+    CaptureViewerApp *app;
+    GtkWidget *dialog;
+    UvcSetupOperationKind kind;
+} UvcSetupOperation;
+
 struct _CaptureViewerApp {
     GtkApplication *application;
     CaptureUi *ui;
@@ -42,6 +59,11 @@ struct _CaptureViewerApp {
     guint current_mode;
     gboolean closing;
     GMutex log_mutex;
+    UvcSetupOperation *uvc_setup_operation;
+    gint64 next_uvc_probe_us;
+    CaptureUvcState uvc_state;
+    gboolean uvc_state_valid;
+    gboolean uvc_prompt_visible;
 };
 
 static void app_refresh_ui(AppState *app);
@@ -54,6 +76,9 @@ static void refresh_video_sources(AppState *app);
 static void refresh_mode_selectors(AppState *app);
 static void refresh_audio_sources(AppState *app);
 static void app_shutdown_state(AppState *app);
+static void app_check_uvc_support(AppState *app);
+static void app_show_uvc_support_manager(AppState *app);
+static gboolean rescan_devices_idle(gpointer user_data);
 
 CaptureViewerApp *
 capture_viewer_app_new(void)
@@ -61,6 +86,7 @@ capture_viewer_app_new(void)
     AppState *app = g_new0(AppState, 1);
     app->preferences = capture_preferences_new();
     app->prefs = capture_preferences_get_values(app->preferences);
+    app->prefs->uvc_setup_dismissed = FALSE;
     g_mutex_init(&app->log_mutex);
     app->log_path = g_build_filename(g_get_user_data_dir(), "captureviewer",
                                     "captureviewer.log", NULL);
@@ -553,6 +579,7 @@ update_devices(gpointer user_data)
     }
 
     refresh_audio_source(app);
+    app_check_uvc_support(app);
 
     if (app->video_device != NULL && app->modes != NULL && app->modes->len > 0 &&
         app->pipeline != NULL && !capture_pipeline_is_running(app->pipeline) &&
@@ -567,6 +594,504 @@ rescan_devices_idle(gpointer user_data)
 {
     update_devices(user_data);
     return G_SOURCE_REMOVE;
+}
+
+enum {
+    UVC_RESPONSE_INSTALL = 1001,
+    UVC_RESPONSE_REPAIR,
+    UVC_RESPONSE_LOAD,
+    UVC_RESPONSE_UNINSTALL,
+};
+
+typedef struct {
+    AppState *app;
+    gboolean automatic;
+} UvcDialogContext;
+
+static const gchar *
+uvc_state_name(CaptureUvcState state)
+{
+    switch (state) {
+    case CAPTURE_UVC_STATE_UNSUPPORTED_PLATFORM:
+        return "unsupported platform";
+    case CAPTURE_UVC_STATE_FLATPAK_UNSUPPORTED:
+        return "Flatpak host changes unavailable";
+    case CAPTURE_UVC_STATE_NATIVE_AVAILABLE:
+        return "native UVC driver available";
+    case CAPTURE_UVC_STATE_COMPAT_LOADED:
+        return "CaptureViewer driver loaded";
+    case CAPTURE_UVC_STATE_COMPAT_LOADED_UNMANAGED:
+        return "unmanaged UVC driver loaded";
+    case CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED:
+        return "CaptureViewer driver installed but not loaded";
+    case CAPTURE_UVC_STATE_DRIVER_REQUIRED:
+        return "compatibility driver required";
+    case CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED:
+        return "Capture support needs updating";
+    case CAPTURE_UVC_STATE_USB_STATUS_UNAVAILABLE:
+        return "USB status unavailable";
+    case CAPTURE_UVC_STATE_USB_NOT_ENUMERATING:
+        return "no USB devices enumerating";
+    case CAPTURE_UVC_STATE_NO_USB_VIDEO_DEVICE:
+        return "no USB UVC video interface found";
+    case CAPTURE_UVC_STATE_DEVICE_NOT_UVC:
+        return "known capture device is not exposing UVC";
+    case CAPTURE_UVC_STATE_HELPER_UNAVAILABLE:
+        return "trusted setup helper unavailable";
+    }
+    return "unknown";
+}
+
+static const gchar *
+uvc_usb_status_name(CaptureUsbStatus status)
+{
+    switch (status) {
+    case CAPTURE_USB_SYSFS_UNAVAILABLE:
+        return "sysfs-unavailable";
+    case CAPTURE_USB_NO_DEVICES:
+        return "no-devices";
+    case CAPTURE_USB_ENUMERATED_NO_VIDEO:
+        return "enumerated-no-video";
+    case CAPTURE_USB_KNOWN_CAPTURE_NO_UVC:
+        return "known-capture-no-uvc";
+    case CAPTURE_USB_UVC_INTERFACE:
+        return "uvc-interface";
+    }
+    return "unknown";
+}
+
+static const gchar *
+uvc_state_message(CaptureUvcState state)
+{
+    switch (state) {
+    case CAPTURE_UVC_STATE_UNSUPPORTED_PLATFORM:
+        return "UVC compatibility setup is supported only on SteamOS arm64.";
+    case CAPTURE_UVC_STATE_FLATPAK_UNSUPPORTED:
+        return "A Flatpak cannot install or load host kernel modules. Use the native SteamOS user installation to manage host capture support.";
+    case CAPTURE_UVC_STATE_NATIVE_AVAILABLE:
+        return "The running kernel provides its native uvcvideo module. CaptureViewer will not replace or load a compatibility module.";
+    case CAPTURE_UVC_STATE_COMPAT_LOADED:
+        return "The verified CaptureViewer compatibility module is loaded.";
+    case CAPTURE_UVC_STATE_COMPAT_LOADED_UNMANAGED:
+        return "uvcvideo is loaded, but CaptureViewer cannot verify that it owns this module. It will not replace or unload it.";
+    case CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED:
+        return "A verified module bundle exists for this kernel but is not loaded. Loading it uses the installed, root-owned bundle.";
+    case CAPTURE_UVC_STATE_DRIVER_REQUIRED:
+        return "A USB UVC interface is present and the kernel has no native uvcvideo module. CaptureViewer can build a kernel-matched compatibility bundle as your user, then request authorization to install it.";
+    case CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED:
+        return "Capture support needs updating. The installed module bundle does not match the running kernel; Repair builds and validates a bundle for the exact kernel before requesting administrator authorization.";
+    case CAPTURE_UVC_STATE_USB_STATUS_UNAVAILABLE:
+        return "CaptureViewer could not inspect the USB device list, so it will not offer first-time driver installation.";
+    case CAPTURE_UVC_STATE_USB_NOT_ENUMERATING:
+        return "Linux currently sees no USB devices. Check the capture card, cable, port, and power; installing a driver cannot fix USB enumeration.";
+    case CAPTURE_UVC_STATE_NO_USB_VIDEO_DEVICE:
+        return "USB devices are enumerating, but none exposes a UVC video interface. Driver installation is not offered.";
+    case CAPTURE_UVC_STATE_DEVICE_NOT_UVC:
+        return "A recognized capture device is present but exposes no UVC video interface. Driver installation is not offered.";
+    case CAPTURE_UVC_STATE_HELPER_UNAVAILABLE:
+        return "The root-owned CaptureViewer helper under /srv/captureviewer is missing or unsafe. Clicking Install provisions the reviewed root helper, then continues the user-side build. A user-local app will not execute its writable files as root.";
+    }
+    return "CaptureViewer could not determine UVC support status.";
+}
+
+static void
+uvc_child_dialog_response(GtkDialog *dialog, gint response, gpointer user_data)
+{
+    AppState *app = user_data;
+    if (app->uvc_setup_operation != NULL &&
+        app->uvc_setup_operation->dialog == GTK_WIDGET(dialog))
+        app->uvc_setup_operation->dialog = NULL;
+    (void)response;
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+static gchar *
+uvc_setup_log_error_line(const gchar *path)
+{
+    FILE *log_file = fopen(path, "r");
+    if (log_file == NULL)
+        return NULL;
+    if (fseeko(log_file, 0, SEEK_END) != 0) {
+        fclose(log_file);
+        return NULL;
+    }
+
+    off_t log_size = ftello(log_file);
+    if (log_size < 0) {
+        fclose(log_file);
+        return NULL;
+    }
+    gchar buffer[4096];
+    off_t start = log_size > (off_t)(sizeof(buffer) - 1)
+        ? log_size - (off_t)(sizeof(buffer) - 1)
+        : 0;
+    if (fseeko(log_file, start, SEEK_SET) != 0) {
+        fclose(log_file);
+        return NULL;
+    }
+    size_t bytes_read = fread(buffer, 1, sizeof(buffer) - 1, log_file);
+    gboolean read_failed = ferror(log_file);
+    fclose(log_file);
+    if (read_failed || bytes_read == 0)
+        return NULL;
+    buffer[bytes_read] = 0;
+
+    gchar *line = buffer;
+    if (start > 0) {
+        gchar *newline = strchr(line, '\n');
+        if (newline == NULL)
+            return NULL;
+        line = newline + 1;
+    }
+    gchar *last_error = NULL;
+    gchar *limit = buffer + bytes_read;
+    while (line < limit) {
+        gchar *newline = strchr(line, '\n');
+        gchar *next = newline != NULL ? newline + 1 : limit;
+        if (newline != NULL)
+            *newline = 0;
+        g_strchomp(line);
+        if (g_strrstr(line, "error") != NULL ||
+            g_strrstr(line, "Error") != NULL ||
+            g_strrstr(line, "failed") != NULL ||
+            g_strrstr(line, "Failed") != NULL)
+            last_error = line;
+        line = next;
+    }
+    if (last_error == NULL)
+        return NULL;
+
+    gchar *valid = g_utf8_make_valid(last_error, -1);
+    if (g_utf8_strlen(valid, -1) > 512) {
+        gchar *prefix = g_utf8_substring(valid, 0, 509);
+        gchar *shortened = g_strconcat(prefix, "...", NULL);
+        g_free(prefix);
+        g_free(valid);
+        valid = shortened;
+    }
+    return valid;
+}
+
+static void
+app_uvc_setup_child_exited(GPid pid, gint wait_status, gpointer user_data)
+{
+    UvcSetupOperation *operation = user_data;
+    AppState *app = operation->app;
+    g_spawn_close_pid(pid);
+    if (app == NULL || app->uvc_setup_operation != operation) {
+        g_free(operation);
+        return;
+    }
+
+    app->uvc_setup_operation = NULL;
+    gboolean succeeded = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0;
+    gboolean modules_busy = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 10;
+    const gchar *message;
+    gchar *log_path = NULL;
+    gchar *error_line = NULL;
+    gchar *process_status = NULL;
+    gchar *failure_detail = NULL;
+    if (succeeded) {
+        switch (operation->kind) {
+        case UVC_SETUP_OPERATION_INSTALL:
+        case UVC_SETUP_OPERATION_REPAIR:
+        case UVC_SETUP_OPERATION_LOAD:
+            message = "Capture support setup completed. CaptureViewer is rescanning video devices.";
+            app->prefs->uvc_setup_dismissed = FALSE;
+            app->next_uvc_probe_us = 0;
+            g_idle_add(rescan_devices_idle, app);
+            break;
+        case UVC_SETUP_OPERATION_UNINSTALL:
+            message = "CaptureViewer-owned support files were removed. Any module that could not be safely unloaded remains loaded; no reboot was requested.";
+            app->prefs->uvc_setup_dismissed = TRUE;
+            app->next_uvc_probe_us = 0;
+            break;
+        default:
+            message = "Capture support operation completed.";
+            break;
+        }
+        app_log(app, "%s", message);
+    } else {
+        log_path = g_build_filename(g_get_user_cache_dir(), "captureviewer",
+                                    "uvc-setup.log", NULL);
+        error_line = uvc_setup_log_error_line(log_path);
+        if (WIFEXITED(wait_status))
+            process_status = g_strdup_printf("exit status %d", WEXITSTATUS(wait_status));
+        else if (WIFSIGNALED(wait_status))
+            process_status = g_strdup_printf("signal %d", WTERMSIG(wait_status));
+        else
+            process_status = g_strdup("abnormal process termination");
+
+        if (modules_busy) {
+            message = "CaptureViewer-owned files were removed, but a module was still in use and remains loaded. Reboot only if you choose to unload it later.";
+        } else {
+            message = "Capture support setup failed.";
+        }
+        if (error_line != NULL) {
+            failure_detail = g_strdup_printf(
+                "Last setup error: %s\nProcess %s.\n\nFull setup log: %s",
+                error_line, process_status, log_path);
+        } else if (modules_busy) {
+            failure_detail = g_strdup_printf(
+                "The module remains loaded (process %s). Full setup log: %s",
+                process_status, log_path);
+        } else {
+            failure_detail = g_strdup_printf(
+                "No error line was recorded; process %s. If authorization was canceled, retry and approve it. Full setup log: %s",
+                process_status, log_path);
+        }
+        app_log(app, "%s (%s): %s", message, process_status, failure_detail);
+    }
+    capture_preferences_schedule_save(app->preferences);
+
+    const gchar *secondary_text = succeeded
+        ? "Authorization was completed for CaptureViewer's fixed module helper."
+        : failure_detail;
+    if (operation->dialog != NULL) {
+        gtk_message_dialog_set_markup(
+            GTK_MESSAGE_DIALOG(operation->dialog), message);
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(operation->dialog), "%s", secondary_text);
+        gtk_window_set_title(GTK_WINDOW(operation->dialog), "Capture support");
+        gtk_dialog_set_response_sensitive(GTK_DIALOG(operation->dialog),
+                                          GTK_RESPONSE_CLOSE, TRUE);
+        operation->dialog = NULL;
+    } else {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            app->ui != NULL ? GTK_WINDOW(capture_ui_get_window(app->ui)) : NULL,
+            GTK_DIALOG_DESTROY_WITH_PARENT,
+            succeeded ? GTK_MESSAGE_INFO : GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_CLOSE, "%s", message);
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(dialog), "%s", secondary_text);
+        gtk_window_set_title(GTK_WINDOW(dialog), "Capture support");
+        g_signal_connect(dialog, "response",
+                         G_CALLBACK(uvc_child_dialog_response), app);
+        gtk_widget_show(dialog);
+    }
+    g_free(log_path);
+    g_free(error_line);
+    g_free(process_status);
+    g_free(failure_detail);
+    g_free(operation);
+}
+
+
+
+static void
+app_start_uvc_setup(AppState *app, UvcSetupOperationKind kind)
+{
+    if (app->uvc_setup_operation != NULL)
+        return;
+
+    CaptureUvcSetupFacts facts;
+    capture_uvc_setup_probe(&facts);
+    CaptureUvcState state = capture_uvc_setup_state(&facts);
+    gboolean first_install_bootstrap =
+        kind == UVC_SETUP_OPERATION_INSTALL &&
+        state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
+        facts.usb_status == CAPTURE_USB_UVC_INTERFACE;
+    gboolean allowed = !facts.flatpak && facts.target_steamos &&
+        (facts.helper_available || first_install_bootstrap) &&
+        ((kind == UVC_SETUP_OPERATION_INSTALL &&
+          ((state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
+            facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+           first_install_bootstrap)) ||
+         (kind == UVC_SETUP_OPERATION_REPAIR &&
+          (state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
+           state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED ||
+           state == CAPTURE_UVC_STATE_COMPAT_LOADED)) ||
+         (kind == UVC_SETUP_OPERATION_LOAD &&
+          state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED) ||
+         (kind == UVC_SETUP_OPERATION_UNINSTALL &&
+          facts.service_installed));
+    if (!allowed) {
+        app_show_uvc_support_manager(app);
+        return;
+    }
+
+    gchar *script = capture_uvc_setup_script_path();
+    const gchar *mode =
+        kind == UVC_SETUP_OPERATION_INSTALL ? "install" :
+        kind == UVC_SETUP_OPERATION_REPAIR ? "repair" :
+        kind == UVC_SETUP_OPERATION_LOAD ? "load" : "uninstall";
+    gchar *argv[] = { script, (gchar *)mode, NULL };
+    UvcSetupOperation *operation = g_new0(UvcSetupOperation, 1);
+    operation->app = app;
+    operation->kind = kind;
+    GError *error = NULL;
+    GPid pid = 0;
+    gboolean spawned = g_spawn_async(
+        NULL, argv, NULL,
+        G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH,
+        NULL, NULL, &pid, &error);
+    g_free(script);
+    if (!spawned) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(capture_ui_get_window(app->ui)),
+            GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_CLOSE, "%s",
+            error != NULL ? error->message : "Could not start setup.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        g_clear_error(&error);
+        g_free(operation);
+        return;
+    }
+
+    app->uvc_setup_operation = operation;
+    app->prefs->uvc_setup_dismissed = TRUE;
+    capture_preferences_schedule_save(app->preferences);
+    operation->dialog = gtk_message_dialog_new(
+        GTK_WINDOW(capture_ui_get_window(app->ui)),
+        GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+        "%s", "Preparing capture support...");
+    gtk_window_set_title(GTK_WINDOW(operation->dialog), "Capture support");
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(operation->dialog), "%s",
+        "Build and validation run as your user. System installation requires the desktop authorization dialog. No reboot is requested.");
+    g_signal_connect(operation->dialog, "response",
+                     G_CALLBACK(uvc_child_dialog_response), app);
+    gtk_widget_show(operation->dialog);
+    g_child_watch_add(pid, app_uvc_setup_child_exited, operation);
+}
+
+static void
+uvc_setup_dialog_response(GtkDialog *dialog, gint response, gpointer user_data)
+{
+    (void)user_data;
+    UvcDialogContext *context =
+        g_object_get_data(G_OBJECT(dialog), "captureviewer-uvc-context");
+    AppState *app = context->app;
+    if (app->uvc_prompt_visible)
+        app->uvc_prompt_visible = FALSE;
+
+    UvcSetupOperationKind operation;
+    gboolean start_operation = TRUE;
+    switch (response) {
+    case UVC_RESPONSE_INSTALL:
+        operation = UVC_SETUP_OPERATION_INSTALL;
+        break;
+    case UVC_RESPONSE_REPAIR:
+        operation = UVC_SETUP_OPERATION_REPAIR;
+        break;
+    case UVC_RESPONSE_LOAD:
+        operation = UVC_SETUP_OPERATION_LOAD;
+        break;
+    case UVC_RESPONSE_UNINSTALL:
+        operation = UVC_SETUP_OPERATION_UNINSTALL;
+        break;
+    default:
+        start_operation = FALSE;
+        if (context->automatic) {
+            app->prefs->uvc_setup_dismissed = TRUE;
+            capture_preferences_schedule_save(app->preferences);
+        }
+        break;
+    }
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+    if (start_operation)
+        app_start_uvc_setup(app, operation);
+}
+
+static void
+app_show_uvc_support_manager(AppState *app)
+{
+    if (app->uvc_setup_operation != NULL &&
+        app->uvc_setup_operation->dialog != NULL) {
+        gtk_window_present(GTK_WINDOW(app->uvc_setup_operation->dialog));
+        return;
+    }
+    if (app->uvc_prompt_visible)
+        return;
+
+    CaptureUvcSetupFacts facts;
+    capture_uvc_setup_probe(&facts);
+    CaptureUvcState state = capture_uvc_setup_state(&facts);
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(capture_ui_get_window(app->ui)), GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_NONE, "%s", uvc_state_name(state));
+    gtk_window_set_title(GTK_WINDOW(dialog), "Manage capture support");
+    const gchar *message = uvc_state_message(state);
+    if (facts.flatpak && state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE)
+        message = "The host's native uvcvideo driver is available. This Flatpak cannot install, load, or uninstall host kernel modules.";
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(dialog), "%s", message);
+
+    gboolean can_manage_host = !facts.flatpak && facts.target_steamos &&
+                               facts.helper_available;
+    gboolean first_install_bootstrap = !facts.flatpak &&
+        facts.target_steamos &&
+        state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
+        facts.usb_status == CAPTURE_USB_UVC_INTERFACE;
+    gboolean can_install =
+        (can_manage_host && state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
+         facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+        first_install_bootstrap;
+    gboolean can_repair = can_manage_host &&
+        (state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
+         state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED ||
+         state == CAPTURE_UVC_STATE_COMPAT_LOADED);
+    gboolean can_load = can_manage_host &&
+        state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED;
+    gboolean can_uninstall = can_manage_host && facts.service_installed;
+    if (can_uninstall)
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Uninstall", UVC_RESPONSE_UNINSTALL);
+    if (can_repair)
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Repair", UVC_RESPONSE_REPAIR);
+    if (can_load)
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Load", UVC_RESPONSE_LOAD);
+    if (can_install)
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Install", UVC_RESPONSE_INSTALL);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "Close", GTK_RESPONSE_CLOSE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CLOSE);
+
+    UvcDialogContext *context = g_new0(UvcDialogContext, 1);
+    context->app = app;
+    context->automatic =
+        can_install || state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
+        (can_load && state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED);
+    app->uvc_prompt_visible = context->automatic;
+    g_object_set_data_full(G_OBJECT(dialog), "captureviewer-uvc-context",
+                           context, g_free);
+    g_signal_connect(dialog, "response",
+                     G_CALLBACK(uvc_setup_dialog_response), NULL);
+    gtk_widget_show(dialog);
+}
+
+static void
+app_check_uvc_support(AppState *app)
+{
+    gint64 now = g_get_monotonic_time();
+    if (now < app->next_uvc_probe_us || app->uvc_setup_operation != NULL)
+        return;
+    app->next_uvc_probe_us = now + 10 * G_USEC_PER_SEC;
+
+    CaptureUvcSetupFacts facts;
+    capture_uvc_setup_probe(&facts);
+    CaptureUvcState state = capture_uvc_setup_state(&facts);
+    if (!app->uvc_state_valid || state != app->uvc_state) {
+        app_log(app, "UVC support state: %s (USB status %s)",
+                uvc_state_name(state), uvc_usb_status_name(facts.usb_status));
+        app->uvc_state = state;
+        app->uvc_state_valid = TRUE;
+    }
+    if (state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE &&
+        app->prefs->uvc_setup_dismissed) {
+        app->prefs->uvc_setup_dismissed = FALSE;
+        capture_preferences_schedule_save(app->preferences);
+    }
+    gboolean setup_needed =
+        state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
+        state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED ||
+        (state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
+         facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+        (state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
+         facts.usb_status == CAPTURE_USB_UVC_INTERFACE &&
+         !facts.flatpak && facts.target_steamos);
+    if (setup_needed && !app->prefs->uvc_setup_dismissed &&
+        !app->uvc_prompt_visible)
+        app_show_uvc_support_manager(app);
 }
 
 static void
@@ -903,6 +1428,9 @@ handle_ui_action(const CaptureUiAction *action, gpointer user_data)
     case CAPTURE_UI_ACTION_QUIT:
         g_application_quit(G_APPLICATION(app->application));
         break;
+    case CAPTURE_UI_ACTION_CAPTURE_SUPPORT:
+        app_show_uvc_support_manager(app);
+        break;
     }
 }
 
@@ -964,6 +1492,15 @@ app_shutdown_state(AppState *app)
     if (app->closing)
         return;
     app->closing = TRUE;
+    if (app->uvc_setup_operation != NULL) {
+        UvcSetupOperation *operation = app->uvc_setup_operation;
+        app->uvc_setup_operation = NULL;
+        operation->app = NULL;
+        if (operation->dialog != NULL) {
+            gtk_widget_destroy(operation->dialog);
+            operation->dialog = NULL;
+        }
+    }
     capture_preferences_save(app->preferences);
     if (app->monitor_watch_id != 0)
         g_source_remove(app->monitor_watch_id);

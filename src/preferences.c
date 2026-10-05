@@ -78,6 +78,9 @@ capture_preferences_new(void)
         if (g_key_file_has_key(key_file, "capture", "advanced-sources", NULL))
             preferences->values.include_advanced_sources =
                 g_key_file_get_boolean(key_file, "capture", "advanced-sources", NULL);
+        if (g_key_file_has_key(key_file, "capture", "uvc-setup-dismissed", NULL))
+            preferences->values.uvc_setup_dismissed =
+                g_key_file_get_boolean(key_file, "capture", "uvc-setup-dismissed", NULL);
         if (preferences->values.selected_video_device_id == NULL &&
             g_key_file_has_key(key_file, "capture", "mode", NULL)) {
             gchar *legacy_mode =
@@ -199,6 +202,8 @@ capture_preferences_save(CapturePreferences *preferences)
         g_key_file_set_string(key_file, "capture", "mode", values->legacy_mode_key);
     g_key_file_set_boolean(key_file, "capture", "advanced-sources",
                            values->include_advanced_sources);
+    g_key_file_set_boolean(key_file, "capture", "uvc-setup-dismissed",
+                           values->uvc_setup_dismissed);
     g_key_file_set_boolean(key_file, "audio", "enabled", values->audio_enabled);
     if (!values->audio_selection_session_only && values->audio_selection_id != NULL)
         g_key_file_set_string(key_file, "audio", "source-id",

@@ -1,0 +1,94 @@
+name: SteamOS ARM64 package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check package version matches tag
+        shell: bash
+        run: |
+          pkgver="$(awk -F= '$1 == "pkgver" { print $2; exit }' packaging/arch/PKGBUILD)"
+          test "v$pkgver" = "$GITHUB_REF_NAME"
+
+      - name: Bootstrap isolated Arch Linux ARM build root
+        shell: bash
+        env:
+          ARCH_ROOT: ${{ runner.temp }}/archlinuxarm
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libarchive-tools
+          curl --fail --location --silent --show-error \
+            https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz \
+            --output "$RUNNER_TEMP/archlinuxarm.tar.gz"
+          sudo mkdir -p "$ARCH_ROOT"
+          sudo bsdtar -xpf "$RUNNER_TEMP/archlinuxarm.tar.gz" -C "$ARCH_ROOT"
+          sudo rm -f "$ARCH_ROOT/etc/resolv.conf"
+          sudo cp -L /etc/resolv.conf "$ARCH_ROOT/etc/resolv.conf"
+          sudo mount --bind /proc "$ARCH_ROOT/proc"
+          sudo mount --rbind /sys "$ARCH_ROOT/sys"
+          sudo mount --make-rslave "$ARCH_ROOT/sys"
+          sudo mount --rbind /dev "$ARCH_ROOT/dev"
+          sudo mount --make-rslave "$ARCH_ROOT/dev"
+          sudo chroot "$ARCH_ROOT" /usr/bin/bash -euxc '
+            pacman-key --init
+            pacman-key --populate archlinuxarm
+            pacman -Syu --noconfirm --needed \
+              base-devel meson ninja pkgconf gtk3 gstreamer \
+              gst-plugins-base-libs gst-plugins-good gst-plugins-bad-libs \
+              libepoxy polkit systemd kmod python curl pacman binutils libarchive
+            useradd --create-home builder
+            install -d -o builder -g builder /home/builder/.cache/makepkg
+            install -d -o builder -g builder /home/builder/CaptureViewer
+          '
+
+      - name: Build Arch package and SteamOS user payload
+        shell: bash
+        env:
+          ARCH_ROOT: ${{ runner.temp }}/archlinuxarm
+        run: |
+          git archive HEAD | sudo tar -xf - -C "$ARCH_ROOT/home/builder/CaptureViewer"
+          sudo cp packaging/steam-frame/install-user.sh packaging/steam-frame/uninstall-user.sh packaging/steam-frame/bootstrap-support.sh "$ARCH_ROOT/home/builder/"
+          sudo chroot "$ARCH_ROOT" chown -R builder:builder /home/builder/CaptureViewer
+          sudo chroot --userspec=builder:builder "$ARCH_ROOT" /usr/bin/env \
+            HOME=/home/builder \
+            BUILDDIR=/home/builder/.cache/makepkg /usr/bin/bash -lc \
+            'cd /home/builder/CaptureViewer/packaging/arch && makepkg --cleanbuild --noconfirm'
+          sudo chroot --userspec=builder:builder "$ARCH_ROOT" /usr/bin/env HOME=/home/builder /usr/bin/bash -lc '
+            set -euo pipefail
+            cd /home/builder/CaptureViewer
+            meson setup build-user --prefix=/captureviewer/app --bindir=bin --libexecdir=libexec --datadir=share
+            DESTDIR=/home/builder/user-stage meson install -C build-user
+            mkdir -p /home/builder/user-payload
+            mv /home/builder/user-stage/captureviewer/app /home/builder/user-payload/app
+            tar --zstd -cf /home/builder/captureviewer-steamos-aarch64.tar.zst -C /home/builder/user-payload app
+          '
+          mkdir -p dist
+          mapfile -t packages < <(find "$ARCH_ROOT/home/builder/CaptureViewer/packaging/arch" \
+            -maxdepth 1 -type f -name 'captureviewer-[0-9]*-aarch64.pkg.tar.zst' -print)
+          test "${#packages[@]}" -eq 1
+          cp "${packages[0]}" dist/
+          cp "$ARCH_ROOT/home/builder/captureviewer-steamos-aarch64.tar.zst" dist/captureviewer-steamos-aarch64.tar.zst
+          cp packaging/steam-frame/install-user.sh packaging/steam-frame/uninstall-user.sh packaging/steam-frame/bootstrap-support.sh dist/
+          (cd dist && sha256sum ./*.pkg.tar.zst ./captureviewer-steamos-aarch64.tar.zst ./*.sh > SHA256SUMS)
+
+      - name: Publish package on the matching GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

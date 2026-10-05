@@ -13,9 +13,10 @@ typedef struct {
     gchar *selected_node_interface;
     gchar *legacy_mode_key;
     gchar *audio_selection_id;
+    gboolean audio_enabled;
     gboolean audio_selection_session_only;
     gboolean include_advanced_sources;
-    gboolean audio_enabled;
+    gboolean uvc_setup_dismissed;
     gdouble volume;
     gboolean pinned;
     gboolean stats_visible;

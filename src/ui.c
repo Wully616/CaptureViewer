@@ -269,6 +269,14 @@ close_settings_button(GtkButton *button, gpointer user_data)
     (void)button;
 }
 
+static void
+capture_support_button_clicked(GtkButton *button, gpointer user_data)
+{
+    CaptureUi *ui = user_data;
+    emit_action(ui, CAPTURE_UI_ACTION_CAPTURE_SUPPORT, NULL, 0.0, FALSE);
+    (void)button;
+}
+
 static gboolean
 close_settings(GtkWidget *widget, GdkEvent *event, gpointer user_data)
 {
@@ -621,6 +629,12 @@ create_settings(CaptureUi *ui, const CapturePreferencesValues *preferences)
     gtk_grid_attach(GTK_GRID(grid), ui->audio_combo, 1, 12, 2, 1);
     g_signal_connect(ui->audio_combo, "changed",
                      G_CALLBACK(on_audio_selection_changed), ui);
+    GtkWidget *capture_support =
+        gtk_button_new_with_label("Manage Capture Support");
+    gtk_widget_set_size_request(capture_support, 300, 48);
+    gtk_grid_attach(GTK_GRID(grid), capture_support, 0, 13, 3, 1);
+    g_signal_connect(capture_support, "clicked",
+                     G_CALLBACK(capture_support_button_clicked), ui);
     g_signal_connect(ui->dwell_spin, "value-changed",
                      G_CALLBACK(on_dwell_changed), ui);
     g_signal_connect(ui->hide_delay_spin, "value-changed",

@@ -1,0 +1,58 @@
+# Builds from the checked-out CaptureViewer source tree. Run makepkg here as a
+# normal user; the package manager owns installed files as root after install.
+pkgname=captureviewer
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Low-latency HDMI capture viewer with opt-in SteamOS UVC setup'
+arch=('aarch64')
+url='https://github.com/Wully616/CaptureViewer'
+license=('unknown')
+depends=(
+    'gtk3'
+    'glib2'
+    'gstreamer'
+    'gst-plugins-base-libs'
+    'gst-plugins-good'
+    'gst-plugins-bad-libs'
+    'libepoxy'
+    'polkit'
+    'systemd'
+    'kmod'
+    'python'
+    'curl'
+    'pacman'
+    'binutils'
+    'libarchive'
+)
+makedepends=('base-devel' 'meson' 'ninja' 'pkgconf')
+optdepends=('base-devel: build kernel-matched UVC modules as the logged-in user')
+options=('!debug')
+
+
+build() {
+    local builddir="$srcdir/build"
+    local source_root="$startdir/../.."
+    meson setup "$builddir" "$source_root" \
+        --prefix=/usr \
+        --buildtype=release
+    meson compile -C "$builddir"
+}
+
+check() {
+    G_DEBUG=fatal-criticals meson test -C "$srcdir/build" --print-errorlogs
+}
+
+package() {
+    DESTDIR="$pkgdir" meson install -C "$srcdir/build" --no-rebuild
+    local source_root="$startdir/../.."
+    install -Dm755 "$source_root/data/uvc/driver-helper.sh" \
+        "$pkgdir/srv/captureviewer/uvc-helper/captureviewer-driver-helper"
+    install -Dm755 "$source_root/data/uvc/load.sh" \
+        "$pkgdir/srv/captureviewer/uvc-helper/load.sh"
+    install -Dm644 "$source_root/data/uvc/verify.py" \
+        "$pkgdir/srv/captureviewer/uvc-helper/verify.py"
+    install -Dm644 "$source_root/data/uvc/captureviewer-uvc.service" \
+        "$pkgdir/srv/captureviewer/uvc-helper/captureviewer-uvc.service"
+    install -Dm644 "$source_root/data/uvc/LICENSE" \
+        "$pkgdir/usr/share/licenses/captureviewer/uvc/LICENSE"
+}

@@ -806,3 +806,58 @@ capture_mode_equal_key(const CaptureMode *mode, const gchar *key)
     g_free(mode_key);
     return equal;
 }
+
+CaptureUsbStatus
+capture_usb_status_at(const gchar *sysfs_devices_path)
+{
+    if (sysfs_devices_path == NULL || *sysfs_devices_path == '\0')
+        return CAPTURE_USB_SYSFS_UNAVAILABLE;
+    GError *error = NULL;
+    GDir *directory = g_dir_open(sysfs_devices_path, 0, &error);
+    if (directory == NULL) {
+        g_clear_error(&error);
+        return CAPTURE_USB_SYSFS_UNAVAILABLE;
+    }
+
+    gboolean have_usb_device = FALSE;
+    gboolean known_capture = FALSE;
+    gboolean uvc_interface = FALSE;
+    const gchar *entry = NULL;
+    while ((entry = g_dir_read_name(directory)) != NULL) {
+        gchar *path = g_build_filename(sysfs_devices_path, entry, NULL);
+        gchar *vendor = read_sysfs_attribute(path, "idVendor");
+        gchar *product = read_sysfs_attribute(path, "idProduct");
+        gchar *interface_class = read_sysfs_attribute(path, "bInterfaceClass");
+        guint16 vendor_id = 0;
+        guint16 product_id = 0;
+
+        if (parse_usb_id(vendor, &vendor_id) &&
+            parse_usb_id(product, &product_id)) {
+            have_usb_device = TRUE;
+            if (vendor_id == 0x345f && product_id == 0x2130)
+                known_capture = TRUE;
+        }
+        if (g_strcmp0(interface_class, "0e") == 0)
+            uvc_interface = TRUE;
+
+        g_free(vendor);
+        g_free(product);
+        g_free(interface_class);
+        g_free(path);
+    }
+    g_dir_close(directory);
+
+    if (uvc_interface)
+        return CAPTURE_USB_UVC_INTERFACE;
+    if (known_capture)
+        return CAPTURE_USB_KNOWN_CAPTURE_NO_UVC;
+    if (have_usb_device)
+        return CAPTURE_USB_ENUMERATED_NO_VIDEO;
+    return CAPTURE_USB_NO_DEVICES;
+}
+
+CaptureUsbStatus
+capture_usb_status(void)
+{
+    return capture_usb_status_at("/sys/bus/usb/devices");
+}

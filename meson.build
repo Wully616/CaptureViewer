@@ -28,6 +28,23 @@ gst_app = dependency('gstreamer-app-1.0', required: true)
 epoxy = dependency('epoxy', required: true)
 math = cc.find_library('m', required: true)
 
+uvc_libexecdir = get_option('libexecdir')
+if not uvc_libexecdir.startswith('/')
+  uvc_libexecdir = join_paths(get_option('prefix'), uvc_libexecdir)
+endif
+uvc_helper_dir = uvc_libexecdir / 'captureviewer' / 'uvc'
+
+uvc_config = configuration_data()
+uvc_config.set_quoted(
+  'CAPTUREVIEWER_UVC_LIBEXECDIR',
+  uvc_helper_dir,
+)
+configure_file(
+  output: 'captureviewer-config.h',
+  configuration: uvc_config,
+)
+
+
 viewer = executable(
   'captureviewer',
   [
@@ -37,6 +54,7 @@ viewer = executable(
     'src/renderer.c',
     'src/pipeline.c',
     'src/preferences.c',
+    'src/uvc_setup.c',
     'src/audio.c',
     'src/ui.c',
   ],
@@ -61,6 +79,14 @@ capture_identity_test = executable(
 )
 test('capture-identity', capture_identity_test)
 
+uvc_setup_test = executable(
+  'test-uvc-setup',
+  ['tests/test_uvc_setup.c', 'src/uvc_setup.c', 'src/capture.c'],
+  dependencies: [glib],
+  c_args: cc_args,
+)
+test('uvc-setup', uvc_setup_test)
+
 install_data(
   'data/io.github.wully616.captureviewer.desktop',
   install_dir: get_option('datadir') / 'applications',
@@ -72,4 +98,22 @@ install_data(
 install_data(
   'data/icons/io.github.wully616.captureviewer.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
+)
+
+install_data(
+  'data/uvc/driver-helper.sh',
+  'data/uvc/captureviewer-uvc.service',
+  'data/uvc/LICENSE',
+  install_dir: get_option('datadir') / 'captureviewer' / 'uvc-support',
+  install_mode: 'rw-r--r--',
+)
+
+install_data(
+  'data/uvc/setup.sh',
+  'data/uvc/build.sh',
+  'data/uvc/load.sh',
+  'data/uvc/verify.py',
+  'packaging/steam-frame/bootstrap-support.sh',
+  install_dir: uvc_helper_dir,
+  install_mode: 'rwxr-xr-x',
 )

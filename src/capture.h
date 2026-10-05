@@ -39,6 +39,19 @@ typedef struct {
     GPtrArray *nodes;
 } CaptureDevice;
 
+typedef enum {
+    CAPTURE_USB_SYSFS_UNAVAILABLE,
+    CAPTURE_USB_NO_DEVICES,
+    CAPTURE_USB_ENUMERATED_NO_VIDEO,
+    CAPTURE_USB_KNOWN_CAPTURE_NO_UVC,
+    CAPTURE_USB_UVC_INTERFACE,
+} CaptureUsbStatus;
+
+/* Describes USB enumeration independently of V4L2 node discovery. */
+CaptureUsbStatus capture_usb_status(void);
+/* Allows callers to inspect a fixture tree; production uses /sys/bus/usb/devices. */
+CaptureUsbStatus capture_usb_status_at(const gchar *sysfs_devices_path);
+
 GPtrArray *capture_devices_enumerate(GError **error);
 /* Returns the snapshot-specific stable ID for a device; caller owns the result. */
 gchar *capture_device_stable_id(GPtrArray *devices, const CaptureDevice *device);
