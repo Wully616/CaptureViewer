@@ -9,6 +9,9 @@ struct _CaptureUi {
     GtkWidget *root_overlay;
     GtkWidget *settings;
     GtkWidget *control_panel;
+    GtkCssProvider *control_css;
+    GtkWidget *control_revealer;
+    GtkWidget *edge_hint;
     GtkWidget *stats_overlay_label;
     GtkWidget *stats_overlay_box;
     GtkWidget *status_overlay;
@@ -32,6 +35,8 @@ struct _CaptureUi {
     GtkWidget *audio_toggle;
     GtkWidget *volume_scale;
     GtkWidget *status_label;
+    GtkWidget *connection_indicator;
+    GtkWidget *connection_status;
     GtkWidget *audio_route_label;
     GtkWidget *pipeline_error_label;
     GtkWidget *log_path_label;
@@ -128,6 +133,14 @@ ui_schedule_panel_hide(CaptureUi *ui)
 }
 
 static void
+set_panel_revealed(CaptureUi *ui, gboolean visible)
+{
+    ui->panel_visible = visible;
+    if (ui->control_revealer != NULL)
+        gtk_revealer_set_reveal_child(GTK_REVEALER(ui->control_revealer), visible);
+}
+
+static void
 ui_show_control_panel(CaptureUi *ui)
 {
     if (ui->dwell_watch_id != 0) {
@@ -138,9 +151,7 @@ ui_show_control_panel(CaptureUi *ui)
         g_source_remove(ui->panel_hide_watch_id);
         ui->panel_hide_watch_id = 0;
     }
-    ui->panel_visible = TRUE;
-    if (ui->control_panel != NULL)
-        gtk_widget_show(ui->control_panel);
+    set_panel_revealed(ui, TRUE);
 }
 
 static void
@@ -149,32 +160,59 @@ ui_hide_control_panel(CaptureUi *ui)
     if (ui->pinned || ui->panel_pointer_inside || ui->edge_hotspot_inside ||
         ui->settings_open || ui->mode_popup_open || ui->interaction_active)
         return;
-    ui->panel_visible = FALSE;
-    if (ui->control_panel != NULL)
-        gtk_widget_hide(ui->control_panel);
+    set_panel_revealed(ui, FALSE);
+}
+
+static void
+ui_set_edge_hotspot(CaptureUi *ui, gboolean inside)
+{
+    if (ui->edge_hotspot_inside == inside)
+        return;
+    ui->edge_hotspot_inside = inside;
+    if (ui->edge_hint != NULL) {
+        GtkStyleContext *style = gtk_widget_get_style_context(ui->edge_hint);
+        if (inside)
+            gtk_style_context_add_class(style, "active");
+        else
+            gtk_style_context_remove_class(style, "active");
+    }
+    if (inside) {
+        if (!ui->panel_visible && ui->dwell_watch_id == 0)
+            ui->dwell_watch_id = g_timeout_add(ui->panel_dwell_ms,
+                                               panel_dwell_timeout, ui);
+        else
+            ui_show_control_panel(ui);
+    } else {
+        if (ui->dwell_watch_id != 0) {
+            g_source_remove(ui->dwell_watch_id);
+            ui->dwell_watch_id = 0;
+        }
+        ui_schedule_panel_hide(ui);
+    }
+}
+
+static gboolean
+edge_hint_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
+{
+    ui_set_edge_hotspot(user_data, TRUE);
+    (void)widget;
+    (void)event;
+    return FALSE;
+}
+
+static gboolean
+edge_hint_leave(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
+{
+    ui_set_edge_hotspot(user_data, FALSE);
+    (void)widget;
+    (void)event;
+    return FALSE;
 }
 
 static gboolean
 window_motion(GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
 {
-    CaptureUi *ui = user_data;
-    gboolean at_edge = event->y <= 8.0;
-    if (at_edge != ui->edge_hotspot_inside) {
-        ui->edge_hotspot_inside = at_edge;
-        if (at_edge) {
-            if (!ui->panel_visible && ui->dwell_watch_id == 0)
-                ui->dwell_watch_id = g_timeout_add(ui->panel_dwell_ms,
-                                                   panel_dwell_timeout, ui);
-            else
-                ui_show_control_panel(ui);
-        } else {
-            if (ui->dwell_watch_id != 0) {
-                g_source_remove(ui->dwell_watch_id);
-                ui->dwell_watch_id = 0;
-            }
-            ui_schedule_panel_hide(ui);
-        }
-    }
+    ui_set_edge_hotspot(user_data, event->y <= 8.0);
     (void)widget;
     return FALSE;
 }
@@ -289,14 +327,15 @@ close_settings(GtkWidget *widget, GdkEvent *event, gpointer user_data)
 static void
 toggle_control_panel(CaptureUi *ui)
 {
+    if (ui->pinned)
+        return;
     if (ui->panel_visible) {
         ui->keyboard_active_until_us = 0;
         if (ui->panel_hide_watch_id != 0) {
             g_source_remove(ui->panel_hide_watch_id);
             ui->panel_hide_watch_id = 0;
         }
-        ui->panel_visible = FALSE;
-        gtk_widget_hide(ui->control_panel);
+        set_panel_revealed(ui, FALSE);
     } else {
         ui->keyboard_active_until_us = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
         ui_show_control_panel(ui);
@@ -334,9 +373,7 @@ key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data)
                 g_source_remove(ui->panel_hide_watch_id);
                 ui->panel_hide_watch_id = 0;
             }
-            ui->panel_visible = FALSE;
-            if (ui->control_panel != NULL)
-                gtk_widget_hide(ui->control_panel);
+            set_panel_revealed(ui, FALSE);
         }
         return TRUE;
     case GDK_KEY_F11:
@@ -595,7 +632,7 @@ create_settings(CaptureUi *ui, const CapturePreferencesValues *preferences)
     attach_diagnostic_row(GTK_GRID(grid), "Log file", ui->log_path_label, 7);
 
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Show controls after"), 0, 8, 1, 1);
-    ui->dwell_spin = gtk_spin_button_new_with_range(100, 250, 10);
+    ui->dwell_spin = gtk_spin_button_new_with_range(300, 500, 10);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->dwell_spin),
                               preferences->panel_dwell_ms);
     gtk_grid_attach(GTK_GRID(grid), ui->dwell_spin, 1, 8, 1, 1);
@@ -659,6 +696,18 @@ create_control_panel(CaptureUi *ui, const CapturePreferencesValues *preferences)
 {
     GtkWidget *panel = gtk_event_box_new();
     ui->control_panel = panel;
+    gtk_widget_set_name(panel, "capture-control-panel");
+    ui->edge_hint = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(ui->edge_hint), TRUE);
+    gtk_widget_set_name(ui->edge_hint, "capture-edge-hint");
+    gtk_widget_set_size_request(ui->edge_hint, 68, 8);
+    gtk_widget_set_halign(ui->edge_hint, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(ui->edge_hint, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(ui->edge_hint, 6);
+    gtk_widget_set_tooltip_text(ui->edge_hint, "Show controls");
+    gtk_widget_add_events(ui->edge_hint, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(ui->edge_hint, "enter-notify-event", G_CALLBACK(edge_hint_enter), ui);
+    g_signal_connect(ui->edge_hint, "leave-notify-event", G_CALLBACK(edge_hint_leave), ui);
     gtk_widget_add_events(panel, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
     g_signal_connect(panel, "enter-notify-event", G_CALLBACK(panel_enter), ui);
     g_signal_connect(panel, "leave-notify-event", G_CALLBACK(panel_leave), ui);
@@ -697,15 +746,46 @@ create_control_panel(CaptureUi *ui, const CapturePreferencesValues *preferences)
     gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(controls), 8);
     gtk_widget_set_hexpand(controls, TRUE);
     gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, TRUE, 0);
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(css,
-        "eventbox { background-color: rgba(12, 15, 20, 0.88); border-radius: 12px; } "
-        "button, combobox, checkbutton { min-height: 44px; }", -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(panel),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(css);
+    ui->control_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(ui->control_css,
+        "#capture-control-panel { background-color: rgba(11, 15, 20, 0.94); "
+        "border: 1px solid rgba(96, 165, 250, 0.30); border-radius: 16px; } "
+        "#capture-control-panel label { color: #F1F5F9; } "
+        "#capture-control-panel button, #capture-control-panel combobox, "
+        "#capture-control-panel checkbutton { min-width: 64px; min-height: 40px; border-radius: 8px; } "
+        "#capture-control-panel button:hover, #capture-control-panel combobox:hover { "
+        "background-color: #1E2633; border-color: #33C3FF; } "
+        "#capture-control-panel #capture-brand-title { font-size: 16px; font-weight: bold; } "
+        "#capture-connection-dot.connected, #capture-connection-state.connected { color: #22C55E; } "
+        "#capture-connection-dot.connecting, #capture-connection-state.connecting { color: #60A5FA; } "
+        "#capture-connection-dot.disconnected, #capture-connection-state.disconnected { color: #94A3B8; } "
+        "#capture-connection-dot.error, #capture-connection-state.error { color: #F87171; } "
+        "#capture-edge-hint { background-color: rgba(148, 163, 184, 0.38); border-radius: 4px; } "
+        "#capture-edge-hint:hover, #capture-edge-hint.active { background-color: #33C3FF; "
+        "box-shadow: 0 0 8px rgba(51, 195, 255, 0.70); }", -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gtk_widget_get_screen(ui->window), GTK_STYLE_PROVIDER(ui->control_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    GtkWidget *selector_label = gtk_label_new("Source");
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *brand = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *logo = gtk_image_new_from_icon_name("io.github.wully616.captureviewer", GTK_ICON_SIZE_BUTTON);
+    gtk_image_set_pixel_size(GTK_IMAGE(logo), 26);
+    gtk_box_pack_start(GTK_BOX(brand), logo, FALSE, FALSE, 0);
+    GtkWidget *brand_title = gtk_label_new("CaptureViewer");
+    gtk_widget_set_name(brand_title, "capture-brand-title");
+    gtk_box_pack_start(GTK_BOX(brand), brand_title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), brand, TRUE, TRUE, 0);
+    GtkWidget *connection = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    ui->connection_indicator = gtk_label_new("●");
+    gtk_widget_set_name(ui->connection_indicator, "capture-connection-dot");
+    ui->connection_status = gtk_label_new("Disconnected");
+    gtk_widget_set_name(ui->connection_status, "capture-connection-state");
+    gtk_box_pack_start(GTK_BOX(connection), ui->connection_indicator, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(connection), ui->connection_status, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(header), connection, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), header, FALSE, TRUE, 4);
+    GtkWidget *selector_label = gtk_label_new("Capture device");
     gtk_widget_set_halign(selector_label, GTK_ALIGN_START);
     GtkWidget *selector = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     ui->source_combo = gtk_combo_box_text_new();
@@ -819,7 +899,16 @@ create_control_panel(CaptureUi *ui, const CapturePreferencesValues *preferences)
     gtk_widget_set_size_request(quit, 76, 48);
     gtk_flow_box_insert(GTK_FLOW_BOX(controls), quit, -1);
     g_signal_connect(quit, "clicked", G_CALLBACK(quit_clicked), ui);
-    gtk_overlay_add_overlay(GTK_OVERLAY(ui->root_overlay), panel);
+    gtk_overlay_add_overlay(GTK_OVERLAY(ui->root_overlay), ui->edge_hint);
+    ui->control_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(ui->control_revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(ui->control_revealer), 180);
+    gtk_container_add(GTK_CONTAINER(ui->control_revealer), panel);
+    gtk_overlay_add_overlay(GTK_OVERLAY(ui->root_overlay), ui->control_revealer);
+    gtk_widget_set_hexpand(ui->control_revealer, TRUE);
+    gtk_widget_set_halign(ui->control_revealer, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(ui->control_revealer, GTK_ALIGN_START);
     gtk_widget_set_halign(panel, GTK_ALIGN_FILL);
     gtk_widget_set_valign(panel, GTK_ALIGN_START);
 
@@ -914,6 +1003,7 @@ capture_ui_new(GtkApplication *application,
 
     ui->window = gtk_application_window_new(application);
     gtk_window_set_title(GTK_WINDOW(ui->window), "CaptureViewer");
+    gtk_window_set_icon_name(GTK_WINDOW(ui->window), "io.github.wully616.captureviewer");
     gtk_window_set_default_size(GTK_WINDOW(ui->window), 1280, 720);
     gtk_widget_set_can_focus(ui->window, TRUE);
     gtk_widget_set_app_paintable(ui->window, TRUE);
@@ -931,9 +1021,14 @@ capture_ui_new(GtkApplication *application,
     create_settings(ui, preferences);
     capture_renderer_connect_motion_events(renderer, window_motion, ui);
     gtk_widget_show_all(ui->window);
+    GdkCursor *arrow_cursor = gdk_cursor_new_for_display(
+        gtk_widget_get_display(ui->window), GDK_LEFT_PTR);
+    if (arrow_cursor != NULL) {
+        gdk_window_set_cursor(gtk_widget_get_window(ui->window), arrow_cursor);
+        g_object_unref(arrow_cursor);
+    }
     gtk_widget_hide(ui->settings);
-    gtk_widget_hide(ui->control_panel);
-    ui->panel_visible = FALSE;
+    set_panel_revealed(ui, FALSE);
     if (ui->pinned)
         ui_show_control_panel(ui);
     return ui;
@@ -948,6 +1043,12 @@ capture_ui_free(CaptureUi *ui)
         g_source_remove(ui->dwell_watch_id);
     if (ui->panel_hide_watch_id != 0)
         g_source_remove(ui->panel_hide_watch_id);
+    if (ui->control_css != NULL) {
+        gtk_style_context_remove_provider_for_screen(
+            gtk_widget_get_screen(ui->window),
+            GTK_STYLE_PROVIDER(ui->control_css));
+        g_object_unref(ui->control_css);
+    }
     gtk_widget_destroy(ui->window);
     ui->window = NULL;
     g_free(ui);
@@ -1240,6 +1341,45 @@ format_renderer_timing_stats(const CaptureRendererTimingStats *stats)
     return g_string_free(text, FALSE);
 }
 
+static void
+update_connection_status(CaptureUi *ui, const CaptureUiModel *model)
+{
+    if (ui->connection_status == NULL || ui->connection_indicator == NULL)
+        return;
+    const gchar *text;
+    const gchar *state;
+    if (model->pipeline_error != NULL && model->pipeline_error[0] != '\0') {
+        text = "Error";
+        state = "error";
+    } else if (model->video_device != NULL && model->pipeline_running &&
+               !model->waiting_for_frames) {
+        text = "Connected";
+        state = "connected";
+    } else if (model->video_device != NULL) {
+        text = "Connecting";
+        state = "connecting";
+    } else {
+        text = "Disconnected";
+        state = "disconnected";
+    }
+    GtkStyleContext *label_style =
+        gtk_widget_get_style_context(ui->connection_status);
+    if (g_strcmp0(gtk_label_get_text(GTK_LABEL(ui->connection_status)), text) == 0 &&
+        gtk_style_context_has_class(label_style, state))
+        return;
+    gtk_label_set_text(GTK_LABEL(ui->connection_status), text);
+    GtkWidget *widgets[] = { ui->connection_indicator, ui->connection_status };
+    static const gchar *const states[] = {
+        "connected", "connecting", "disconnected", "error"
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(widgets); i++) {
+        GtkStyleContext *style = gtk_widget_get_style_context(widgets[i]);
+        for (guint j = 0; j < G_N_ELEMENTS(states); j++)
+            gtk_style_context_remove_class(style, states[j]);
+        gtk_style_context_add_class(style, state);
+    }
+}
+
 void
 capture_ui_update(CaptureUi *ui, const CaptureUiModel *model)
 {
@@ -1251,6 +1391,7 @@ capture_ui_update(CaptureUi *ui, const CaptureUiModel *model)
     CapturePipelineStats stats = model->pipeline_stats;
     const gchar *pipeline_error = model->pipeline_error;
     gboolean waiting_for_frames = model->waiting_for_frames;
+    update_connection_status(ui, model);
     gboolean show_diagnostics =
         ui->settings != NULL && gtk_widget_get_visible(ui->settings);
     CaptureMode *mode = model->modes != NULL &&
