@@ -127,6 +127,18 @@ test_usb_absence_does_not_trigger_driver_install(void)
 }
 
 static void
+test_loaded_uvc_module_is_recognized_without_usb(void)
+{
+    CaptureUvcSetupFacts facts = facts_for(CAPTURE_USB_NO_DEVICES);
+    facts.module_loaded = TRUE;
+    g_assert_cmpint(capture_uvc_setup_state(&facts), ==,
+                    CAPTURE_UVC_STATE_COMPAT_LOADED_UNMANAGED);
+    facts.service_installed = TRUE;
+    g_assert_cmpint(capture_uvc_setup_state(&facts), ==,
+                    CAPTURE_UVC_STATE_COMPAT_LOADED);
+}
+
+static void
 test_only_enumerated_uvc_interface_offers_install(void)
 {
     CaptureUvcSetupFacts facts = facts_for(CAPTURE_USB_ENUMERATED_NO_VIDEO);
@@ -228,6 +240,8 @@ main(int argc, char **argv)
                     test_usb_absence_precedes_missing_helper);
     g_test_add_func("/uvc/setup/usb-absence-does-not-install",
                     test_usb_absence_does_not_trigger_driver_install);
+    g_test_add_func("/uvc/setup/loaded-module-without-usb",
+                    test_loaded_uvc_module_is_recognized_without_usb);
     g_test_add_func("/uvc/setup/only-uvc-interface-offers-install",
                     test_only_enumerated_uvc_interface_offers_install);
     g_test_add_func("/uvc/setup/unsafe-helper-blocks-setup",

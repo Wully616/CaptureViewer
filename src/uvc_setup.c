@@ -230,12 +230,16 @@ capture_uvc_setup_probe(CaptureUvcSetupFacts *facts)
     const gchar *flatpak_id = g_getenv("FLATPAK_ID");
     facts->flatpak = flatpak_id != NULL && *flatpak_id != '\0';
     facts->target_steamos = is_steamos_arm64(facts->flatpak);
+    facts->module_loaded = g_file_test("/sys/module/uvcvideo", G_FILE_TEST_EXISTS);
+    facts->usb_status = capture_usb_status();
+    if (!facts->module_loaded &&
+        facts->usb_status != CAPTURE_USB_UVC_INTERFACE)
+        return;
+
     facts->kernel_module_available = kernel_has_uvcvideo();
     facts->helper_available = helper_files_are_secure();
     facts->service_installed = installed_service_exists();
     facts->current_kernel_modules = modules_exist_for_kernel();
-    facts->module_loaded = g_file_test("/sys/module/uvcvideo", G_FILE_TEST_EXISTS);
-    facts->usb_status = capture_usb_status();
 }
 
 CaptureUvcState

@@ -9,6 +9,7 @@ Tested on Steam Frame with the Hagibis UHC07 HDMI capture card (USB VID `345f`, 
 ## UVC support on Steam Frame
 
 If SteamOS's native `uvcvideo` driver does not bind to the capture card, V4L2 cannot provide its capture modes. Open CaptureViewer's **Advanced Capture Diagnostics** panel and select **Manage Capture Support**, then choose **Install** when support is needed. CaptureViewer installs a compatibility module for the running kernel and configures it to load on startup.
+CaptureViewer checks support status in the background, so a slow host-module lookup does not stall the viewer; an already loaded `uvcvideo` module is recognized without a connected capture card.
 
 The module is installed outside the app so it remains available across app restarts. Persistence across SteamOS updates has not been verified.
 

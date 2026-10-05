@@ -30,12 +30,17 @@ typedef enum {
     UVC_SETUP_OPERATION_LOAD,
     UVC_SETUP_OPERATION_UNINSTALL,
 } UvcSetupOperationKind;
+typedef struct _UvcProbeRequest UvcProbeRequest;
 
 typedef struct {
     CaptureViewerApp *app;
     GtkWidget *dialog;
     UvcSetupOperationKind kind;
 } UvcSetupOperation;
+struct _UvcProbeRequest {
+    CaptureViewerApp *app;
+    gboolean automatic_check;
+};
 
 struct _CaptureViewerApp {
     GtkApplication *application;
@@ -60,6 +65,12 @@ struct _CaptureViewerApp {
     gboolean closing;
     GMutex log_mutex;
     UvcSetupOperation *uvc_setup_operation;
+    UvcProbeRequest *uvc_probe_request;
+    gboolean uvc_manager_requested;
+    gboolean uvc_setup_request_pending;
+    UvcSetupOperationKind pending_uvc_setup_kind;
+    gboolean startup_device_enumeration_pending;
+    gboolean pipeline_start_logged;
     gint64 next_uvc_probe_us;
     CaptureUvcState uvc_state;
     gboolean uvc_state_valid;
@@ -78,6 +89,10 @@ static void refresh_audio_sources(AppState *app);
 static void app_shutdown_state(AppState *app);
 static void app_check_uvc_support(AppState *app);
 static void app_show_uvc_support_manager(AppState *app);
+static void app_show_uvc_support_manager_with_facts(
+    AppState *app, const CaptureUvcSetupFacts *facts);
+static void app_request_uvc_probe(AppState *app, gboolean automatic_check);
+static void app_request_uvc_setup(AppState *app, UvcSetupOperationKind kind);
 static gboolean rescan_devices_idle(gpointer user_data);
 
 CaptureViewerApp *
@@ -293,6 +308,13 @@ pipeline_start(AppState *app)
 
     CaptureMode *mode = g_ptr_array_index(app->modes, app->current_mode);
     CaptureAudioState audio_state = capture_audio_get_state(app->audio);
+    if (!app->pipeline_start_logged) {
+        app->pipeline_start_logged = TRUE;
+        app_log(app, "Starting capture pipeline: %s at %s, mode %s",
+                app->video_device->display_name != NULL
+                    ? app->video_device->display_name : "capture source",
+                app->video_node->path, mode->label);
+    }
     gboolean started = capture_pipeline_start(
         app->pipeline, app->video_device, app->video_node, mode,
         audio_state.source, app->prefs->audio_enabled, app->prefs->volume,
@@ -569,7 +591,14 @@ update_devices(gpointer user_data)
         return G_SOURCE_REMOVE;
 
     GError *error = NULL;
+    if (app->startup_device_enumeration_pending)
+        app_log(app, "Initial device enumeration started");
     GPtrArray *fresh_devices = capture_devices_enumerate(&error);
+    if (app->startup_device_enumeration_pending) {
+        app->startup_device_enumeration_pending = FALSE;
+        app_log(app, "Initial device enumeration completed: %u device(s)",
+                fresh_devices != NULL ? fresh_devices->len : 0);
+    }
     if (fresh_devices == NULL) {
         app_log(app, "Capture-device enumeration failed: %s",
                 error != NULL ? error->message : "unknown error");
@@ -879,23 +908,22 @@ app_uvc_setup_child_exited(GPid pid, gint wait_status, gpointer user_data)
 
 
 static void
-app_start_uvc_setup(AppState *app, UvcSetupOperationKind kind)
+app_start_uvc_setup(AppState *app, UvcSetupOperationKind kind,
+                    const CaptureUvcSetupFacts *facts)
 {
-    if (app->uvc_setup_operation != NULL)
+    if (app->closing || app->uvc_setup_operation != NULL || facts == NULL)
         return;
 
-    CaptureUvcSetupFacts facts;
-    capture_uvc_setup_probe(&facts);
-    CaptureUvcState state = capture_uvc_setup_state(&facts);
+    CaptureUvcState state = capture_uvc_setup_state(facts);
     gboolean first_install_bootstrap =
         kind == UVC_SETUP_OPERATION_INSTALL &&
         state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
-        facts.usb_status == CAPTURE_USB_UVC_INTERFACE;
-    gboolean allowed = !facts.flatpak && facts.target_steamos &&
-        (facts.helper_available || first_install_bootstrap) &&
+        facts->usb_status == CAPTURE_USB_UVC_INTERFACE;
+    gboolean allowed = !facts->flatpak && facts->target_steamos &&
+        (facts->helper_available || first_install_bootstrap) &&
         ((kind == UVC_SETUP_OPERATION_INSTALL &&
           ((state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
-            facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+            facts->usb_status == CAPTURE_USB_UVC_INTERFACE) ||
            first_install_bootstrap)) ||
          (kind == UVC_SETUP_OPERATION_REPAIR &&
           (state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
@@ -904,9 +932,9 @@ app_start_uvc_setup(AppState *app, UvcSetupOperationKind kind)
          (kind == UVC_SETUP_OPERATION_LOAD &&
           state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED) ||
          (kind == UVC_SETUP_OPERATION_UNINSTALL &&
-          facts.service_installed));
+          facts->service_installed));
     if (!allowed) {
-        app_show_uvc_support_manager(app);
+        app_show_uvc_support_manager_with_facts(app, facts);
         return;
     }
 
@@ -957,6 +985,126 @@ app_start_uvc_setup(AppState *app, UvcSetupOperationKind kind)
 }
 
 static void
+uvc_setup_probe_worker(GTask *task, gpointer source_object,
+                       gpointer task_data, GCancellable *cancellable)
+{
+    CaptureUvcSetupFacts *facts = g_new(CaptureUvcSetupFacts, 1);
+    capture_uvc_setup_probe(facts);
+    g_task_return_pointer(task, facts, g_free);
+    (void)source_object;
+    (void)task_data;
+    (void)cancellable;
+}
+
+static gboolean
+uvc_state_requires_setup(const CaptureUvcSetupFacts *facts,
+                         CaptureUvcState state)
+{
+    return state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
+        state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED ||
+        (state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
+         facts->usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+        (state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
+         facts->usb_status == CAPTURE_USB_UVC_INTERFACE &&
+         !facts->flatpak && facts->target_steamos);
+}
+
+static void
+uvc_setup_probe_complete(GObject *source_object, GAsyncResult *result,
+                         gpointer user_data)
+{
+    UvcProbeRequest *request = user_data;
+    AppState *app = request->app;
+    GError *error = NULL;
+    CaptureUvcSetupFacts *facts =
+        g_task_propagate_pointer(G_TASK(result), &error);
+
+    if (app != NULL) {
+        if (app->uvc_probe_request == request)
+            app->uvc_probe_request = NULL;
+        if (!app->closing) {
+            if (facts == NULL) {
+                app_log(app, "UVC status check failed: %s",
+                        error != NULL ? error->message : "unknown error");
+                app->uvc_manager_requested = FALSE;
+                app->uvc_setup_request_pending = FALSE;
+            } else {
+                CaptureUvcState state = capture_uvc_setup_state(facts);
+                app_log(app, "UVC status check completed: %s (USB status %s)",
+                        uvc_state_name(state),
+                        uvc_usb_status_name(facts->usb_status));
+                if (!app->uvc_state_valid || state != app->uvc_state) {
+                    app_log(app, "UVC support state: %s (USB status %s)",
+                            uvc_state_name(state),
+                            uvc_usb_status_name(facts->usb_status));
+                    app->uvc_state = state;
+                    app->uvc_state_valid = TRUE;
+                }
+                if (state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE &&
+                    app->prefs->uvc_setup_dismissed) {
+                    app->prefs->uvc_setup_dismissed = FALSE;
+                    capture_preferences_schedule_save(app->preferences);
+                }
+
+                gboolean manager_requested = app->uvc_manager_requested;
+                gboolean setup_request_pending =
+                    app->uvc_setup_request_pending;
+                app->uvc_manager_requested = FALSE;
+                if (setup_request_pending) {
+                    UvcSetupOperationKind kind = app->pending_uvc_setup_kind;
+                    app->uvc_setup_request_pending = FALSE;
+                    app_start_uvc_setup(app, kind, facts);
+                } else if (manager_requested) {
+                    app_show_uvc_support_manager_with_facts(app, facts);
+                } else if (request->automatic_check &&
+                           uvc_state_requires_setup(facts, state) &&
+                           !app->prefs->uvc_setup_dismissed &&
+                           !app->uvc_prompt_visible) {
+                    app_show_uvc_support_manager_with_facts(app, facts);
+                }
+            }
+        }
+    }
+
+    g_clear_error(&error);
+    g_free(facts);
+    g_free(request);
+    (void)source_object;
+}
+
+static void
+app_request_uvc_probe(AppState *app, gboolean automatic_check)
+{
+    if (app->closing)
+        return;
+    if (app->uvc_probe_request != NULL) {
+        if (automatic_check)
+            app->uvc_probe_request->automatic_check = TRUE;
+        return;
+    }
+
+    UvcProbeRequest *request = g_new0(UvcProbeRequest, 1);
+    request->app = app;
+    request->automatic_check = automatic_check;
+    app->uvc_probe_request = request;
+    app_log(app, "UVC status check started (%s)",
+            automatic_check ? "scheduled" : "requested");
+    GTask *task = g_task_new(NULL, NULL, uvc_setup_probe_complete, request);
+    g_task_run_in_thread(task, uvc_setup_probe_worker);
+    g_object_unref(task);
+}
+
+static void
+app_request_uvc_setup(AppState *app, UvcSetupOperationKind kind)
+{
+    if (app->closing || app->uvc_setup_operation != NULL)
+        return;
+    app->pending_uvc_setup_kind = kind;
+    app->uvc_setup_request_pending = TRUE;
+    app_request_uvc_probe(app, FALSE);
+}
+
+static void
 uvc_setup_dialog_response(GtkDialog *dialog, gint response, gpointer user_data)
 {
     (void)user_data;
@@ -991,12 +1139,14 @@ uvc_setup_dialog_response(GtkDialog *dialog, gint response, gpointer user_data)
     }
     gtk_widget_destroy(GTK_WIDGET(dialog));
     if (start_operation)
-        app_start_uvc_setup(app, operation);
+        app_request_uvc_setup(app, operation);
 }
 
 static void
 app_show_uvc_support_manager(AppState *app)
 {
+    if (app->closing || app->ui == NULL)
+        return;
     if (app->uvc_setup_operation != NULL &&
         app->uvc_setup_operation->dialog != NULL) {
         gtk_window_present(GTK_WINDOW(app->uvc_setup_operation->dialog));
@@ -1005,28 +1155,44 @@ app_show_uvc_support_manager(AppState *app)
     if (app->uvc_prompt_visible)
         return;
 
-    CaptureUvcSetupFacts facts;
-    capture_uvc_setup_probe(&facts);
-    CaptureUvcState state = capture_uvc_setup_state(&facts);
+    app->uvc_manager_requested = TRUE;
+    app_request_uvc_probe(app, FALSE);
+}
+
+static void
+app_show_uvc_support_manager_with_facts(
+    AppState *app, const CaptureUvcSetupFacts *facts)
+{
+    if (app->closing || app->ui == NULL || facts == NULL)
+        return;
+    if (app->uvc_setup_operation != NULL &&
+        app->uvc_setup_operation->dialog != NULL) {
+        gtk_window_present(GTK_WINDOW(app->uvc_setup_operation->dialog));
+        return;
+    }
+    if (app->uvc_prompt_visible)
+        return;
+
+    CaptureUvcState state = capture_uvc_setup_state(facts);
     GtkWidget *dialog = gtk_message_dialog_new(
         GTK_WINDOW(capture_ui_get_window(app->ui)), GTK_DIALOG_DESTROY_WITH_PARENT,
         GTK_MESSAGE_INFO, GTK_BUTTONS_NONE, "%s", uvc_state_name(state));
     gtk_window_set_title(GTK_WINDOW(dialog), "Manage capture support");
     const gchar *message = uvc_state_message(state);
-    if (facts.flatpak && state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE)
+    if (facts->flatpak && state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE)
         message = "The host's native uvcvideo driver is available. This Flatpak cannot install, load, or uninstall host kernel modules.";
     gtk_message_dialog_format_secondary_text(
         GTK_MESSAGE_DIALOG(dialog), "%s", message);
 
-    gboolean can_manage_host = !facts.flatpak && facts.target_steamos &&
-                               facts.helper_available;
-    gboolean first_install_bootstrap = !facts.flatpak &&
-        facts.target_steamos &&
+    gboolean can_manage_host = !facts->flatpak && facts->target_steamos &&
+                               facts->helper_available;
+    gboolean first_install_bootstrap = !facts->flatpak &&
+        facts->target_steamos &&
         state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
-        facts.usb_status == CAPTURE_USB_UVC_INTERFACE;
+        facts->usb_status == CAPTURE_USB_UVC_INTERFACE;
     gboolean can_install =
         (can_manage_host && state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
-         facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
+         facts->usb_status == CAPTURE_USB_UVC_INTERFACE) ||
         first_install_bootstrap;
     gboolean can_repair = can_manage_host &&
         (state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
@@ -1034,7 +1200,7 @@ app_show_uvc_support_manager(AppState *app)
          state == CAPTURE_UVC_STATE_COMPAT_LOADED);
     gboolean can_load = can_manage_host &&
         state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED;
-    gboolean can_uninstall = can_manage_host && facts.service_installed;
+    gboolean can_uninstall = can_manage_host && facts->service_installed;
     if (can_uninstall)
         gtk_dialog_add_button(GTK_DIALOG(dialog), "Uninstall", UVC_RESPONSE_UNINSTALL);
     if (can_repair)
@@ -1063,35 +1229,11 @@ static void
 app_check_uvc_support(AppState *app)
 {
     gint64 now = g_get_monotonic_time();
-    if (now < app->next_uvc_probe_us || app->uvc_setup_operation != NULL)
+    if (app->closing || now < app->next_uvc_probe_us ||
+        app->uvc_setup_operation != NULL)
         return;
     app->next_uvc_probe_us = now + 10 * G_USEC_PER_SEC;
-
-    CaptureUvcSetupFacts facts;
-    capture_uvc_setup_probe(&facts);
-    CaptureUvcState state = capture_uvc_setup_state(&facts);
-    if (!app->uvc_state_valid || state != app->uvc_state) {
-        app_log(app, "UVC support state: %s (USB status %s)",
-                uvc_state_name(state), uvc_usb_status_name(facts.usb_status));
-        app->uvc_state = state;
-        app->uvc_state_valid = TRUE;
-    }
-    if (state == CAPTURE_UVC_STATE_NATIVE_AVAILABLE &&
-        app->prefs->uvc_setup_dismissed) {
-        app->prefs->uvc_setup_dismissed = FALSE;
-        capture_preferences_schedule_save(app->preferences);
-    }
-    gboolean setup_needed =
-        state == CAPTURE_UVC_STATE_DRIVER_UPDATE_REQUIRED ||
-        state == CAPTURE_UVC_STATE_COMPAT_INSTALLED_NOT_LOADED ||
-        (state == CAPTURE_UVC_STATE_DRIVER_REQUIRED &&
-         facts.usb_status == CAPTURE_USB_UVC_INTERFACE) ||
-        (state == CAPTURE_UVC_STATE_HELPER_UNAVAILABLE &&
-         facts.usb_status == CAPTURE_USB_UVC_INTERFACE &&
-         !facts.flatpak && facts.target_steamos);
-    if (setup_needed && !app->prefs->uvc_setup_dismissed &&
-        !app->uvc_prompt_visible)
-        app_show_uvc_support_manager(app);
+    app_request_uvc_probe(app, TRUE);
 }
 
 static void
@@ -1440,6 +1582,7 @@ capture_viewer_app_activate(GtkApplication *application, gpointer user_data)
 {
     AppState *app = user_data;
     app->application = application;
+    app_log(app, "Application activation started");
     if (app->ui != NULL) {
         capture_ui_present(app->ui);
         return;
@@ -1470,9 +1613,11 @@ capture_viewer_app_activate(GtkApplication *application, gpointer user_data)
     };
     app->ui = capture_ui_new(application, app->renderer, app->prefs,
                              &ui_callbacks, app);
+    app_log(app, "Window created");
     capture_ui_present(app->ui);
     app_log_session_context(app);
     app_log_renderer_backend(app);
+    app_log(app, "Video renderer ready");
     app->audio = capture_audio_new(audio_device_event, app);
     if (!capture_audio_start(app->audio))
         app_log(app, "GStreamer device monitor could not start; periodic sysfs scan remains active");
@@ -1480,6 +1625,7 @@ capture_viewer_app_activate(GtkApplication *application, gpointer user_data)
     refresh_audio_sources(app);
     refresh_video_sources(app);
     refresh_mode_selectors(app);
+    app->startup_device_enumeration_pending = TRUE;
     update_devices(app);
     app->monitor_watch_id = g_timeout_add(DEVICE_RESCAN_MS, update_devices, app);
     app->stats_watch_id = g_timeout_add(333, stats_update, app);
@@ -1492,6 +1638,12 @@ app_shutdown_state(AppState *app)
     if (app->closing)
         return;
     app->closing = TRUE;
+    if (app->uvc_probe_request != NULL) {
+        app->uvc_probe_request->app = NULL;
+        app->uvc_probe_request = NULL;
+    }
+    app->uvc_manager_requested = FALSE;
+    app->uvc_setup_request_pending = FALSE;
     if (app->uvc_setup_operation != NULL) {
         UvcSetupOperation *operation = app->uvc_setup_operation;
         app->uvc_setup_operation = NULL;
