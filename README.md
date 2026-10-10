@@ -23,7 +23,7 @@ These are not end-to-end capture-to-display measurements. They exclude camera/HD
 
 ## Build and install on SteamOS
 
-Build requirements: a C compiler, Meson 0.60 or newer, Ninja, pkg-config, GTK 3, GLib 2.74 or newer, GStreamer core/video/audio/app development libraries, libepoxy, GNU tar, and zstd. Run these commands from the repository root to build a user-installable archive and install it without system-wide package installation:
+Build requirements: a C compiler, Meson 0.60 or newer, Ninja, pkg-config, GTK 3, GLib 2.74 or newer, GStreamer core/video/audio/app development libraries and `gst-inspect-1.0`, libepoxy, GNU tar, zstd, `pacman`, `curl`, `bsdtar` (`libarchive`), `sha256sum`, and the `licenses` package. The archive builder downloads and checksum-verifies the repository-matched `gst-plugins-good` package, then extracts only CaptureViewer's required plugins without installing the package system-wide.
 
 ```sh
 set -euo pipefail
@@ -37,6 +37,7 @@ meson setup "$tmp/build" \
 
 meson compile -C "$tmp/build"
 DESTDIR="$tmp/stage" meson install -C "$tmp/build"
+bash packaging/steam-frame/bundle-gstreamer-good.sh "$tmp/stage/captureviewer/app"
 
 mkdir -p "$tmp/payload"
 mv "$tmp/stage/captureviewer/app" "$tmp/payload/app"
@@ -46,3 +47,5 @@ tar --zstd -cf "$tmp/captureviewer-steamos-aarch64.tar.zst" \
 bash packaging/steam-frame/install-user.sh \
   "$tmp/captureviewer-steamos-aarch64.tar.zst"
 ```
+
+The archive includes `v4l2src`, `jpegdec`, and PulseAudio GStreamer plugins. It still uses SteamOS's GStreamer core/base libraries, GTK, and system shared libraries; this is a private plugin bundle, not a fully self-contained runtime.

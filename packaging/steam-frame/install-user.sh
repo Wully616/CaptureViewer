@@ -71,6 +71,12 @@ fi
 [[ -f $work/extract/app/bin/captureviewer && -x $work/extract/app/bin/captureviewer ]] || {
   printf 'Payload is missing executable app/bin/captureviewer\n' >&2; exit 1;
 }
+for plugin in libgstvideo4linux2.so libgstjpeg.so libgstpulseaudio.so; do
+  bundled_plugin=$work/extract/app/lib/captureviewer/gstreamer-1.0/$plugin
+  [[ -f $bundled_plugin && ! -L $bundled_plugin ]] || {
+    printf 'Payload is missing bundled GStreamer plugin %s\n' "$plugin" >&2; exit 1;
+  }
+done
 
 # Stage alongside destination so rename stays on one filesystem.
 install -d -- "$work/staged"

@@ -46,7 +46,7 @@ jobs:
             pacman -Syu --noconfirm --needed \
               base-devel meson ninja pkgconf gtk3 gstreamer \
               gst-plugins-base-libs gst-plugins-good gst-plugins-bad-libs \
-              libepoxy polkit systemd kmod python curl pacman binutils libarchive
+              libepoxy polkit systemd kmod python curl pacman binutils libarchive licenses
             useradd --create-home builder
             install -d -o builder -g builder /home/builder/.cache/makepkg
             install -d -o builder -g builder /home/builder/CaptureViewer
@@ -69,6 +69,7 @@ jobs:
             cd /home/builder/CaptureViewer
             meson setup build-user --prefix=/captureviewer/app --bindir=bin --libexecdir=libexec --datadir=share
             DESTDIR=/home/builder/user-stage meson install -C build-user
+            /usr/bin/bash packaging/steam-frame/bundle-gstreamer-good.sh /home/builder/user-stage/captureviewer/app
             mkdir -p /home/builder/user-payload
             mv /home/builder/user-stage/captureviewer/app /home/builder/user-payload/app
             tar --zstd -cf /home/builder/captureviewer-steamos-aarch64.tar.zst -C /home/builder/user-payload app
